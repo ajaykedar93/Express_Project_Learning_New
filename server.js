@@ -9,6 +9,7 @@ const personalUserRoutes = require("./routes/personal_user");
 const personalOverviewRoutes = require("./routes/personal_overview");
 const personalTradingRoutes = require("./routes/personal_trading");
 const authRoutes = require("./routes/auth"); // ✅ Added Auth Routes
+const personalTransactionsRoutes = require('./routes/personal_transactions');
 
 const app = express();
 
@@ -35,6 +36,8 @@ app.use("/api/personal-overview", personalOverviewRoutes);
 
 // Personal Trading API
 app.use("/api/personal-trading", personalTradingRoutes);
+
+app.use('/api/personal-transactions', personalTransactionsRoutes);
 
 // =============================================
 // HEALTH CHECK
