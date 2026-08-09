@@ -8,87 +8,152 @@ const db = require("./db");
 const personalUserRoutes = require("./routes/personal_user");
 const personalOverviewRoutes = require("./routes/personal_overview");
 const personalTradingRoutes = require("./routes/personal_trading");
-const authRoutes = require("./routes/auth"); // ✅ Added Auth Routes
-const personalTransactionsRoutes = require('./routes/personal_transactions');
+const authRoutes = require("./routes/auth");
+const personalTransactionsRoutes = require("./routes/personal_transactions");
+const personalLoansRoutes = require("./routes/personal_loans");
 
 const app = express();
 
-// Middleware
-app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
-  credentials: true
-}));
+// =============================================
+// CORS
+// =============================================
+
+const allowedOrigins = [
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "https://react-learning-project-lime.vercel.app"
+];
+
+if (process.env.CLIENT_URL) {
+    allowedOrigins.push(
+        process.env.CLIENT_URL.replace(/\/$/, "")
+    );
+}
+
+app.use(
+    cors({
+        origin: (origin, callback) => {
+            if (!origin) {
+                return callback(null, true);
+            }
+
+            const cleanOrigin = origin.replace(/\/$/, "");
+
+            if (allowedOrigins.includes(cleanOrigin)) {
+                return callback(null, true);
+            }
+
+            return callback(new Error("Not allowed by CORS"));
+        },
+        credentials: true,
+        methods: [
+            "GET",
+            "POST",
+            "PUT",
+            "PATCH",
+            "DELETE",
+            "OPTIONS"
+        ],
+        allowedHeaders: [
+            "Content-Type",
+            "Authorization"
+        ]
+    })
+);
+
+// =============================================
+// MIDDLEWARE
+// =============================================
+
 app.use(express.json({ limit: "10mb" }));
-app.use(express.urlencoded({ extended: true, limit: "10mb" }));
+
+app.use(
+    express.urlencoded({
+        extended: true,
+        limit: "10mb"
+    })
+);
 
 // =============================================
 // ROUTES
 // =============================================
 
-// ✅ Auth Routes (Login, Register, Forgot, OTP)
 app.use("/api/auth", authRoutes);
 
-// Personal User API
-app.use("/api/personal-users", personalUserRoutes);
+app.use(
+    "/api/personal-users",
+    personalUserRoutes
+);
 
-// Personal Overview API
-app.use("/api/personal-overview", personalOverviewRoutes);
+app.use(
+    "/api/personal-overview",
+    personalOverviewRoutes
+);
 
-// Personal Trading API
-app.use("/api/personal-trading", personalTradingRoutes);
+app.use(
+    "/api/personal-trading",
+    personalTradingRoutes
+);
 
-app.use('/api/personal-transactions', personalTransactionsRoutes);
+app.use(
+    "/api/personal-transactions",
+    personalTransactionsRoutes
+);
+
+app.use(
+    "/api/personal-loans",
+    personalLoansRoutes
+);
 
 // =============================================
 // HEALTH CHECK
 // =============================================
+
 app.get("/api/health", (req, res) => {
-  res.json({ 
-    success: true, 
-    message: "Server is running",
-    timestamp: new Date().toISOString()
-  });
+    res.status(200).json({
+        success: true,
+        message: "Server is running",
+        timestamp: new Date().toISOString()
+    });
 });
 
 // =============================================
 // 404 HANDLER
 // =============================================
+
 app.use((req, res) => {
-  res.status(404).json({
-    success: false,
-    message: `Route not found: ${req.method} ${req.path}`
-  });
+    res.status(404).json({
+        success: false,
+        message: `Route not found: ${req.method} ${req.path}`
+    });
 });
 
 // =============================================
 // ERROR HANDLER
 // =============================================
+
 app.use((err, req, res, next) => {
-  console.error('❌ Server Error:', err.message);
-  res.status(500).json({
-    success: false,
-    message: 'Internal server error',
-    error: process.env.NODE_ENV === 'development' ? err.message : undefined
-  });
+    console.error("Server Error:", err.message);
+
+    if (err.message === "Not allowed by CORS") {
+        return res.status(403).json({
+            success: false,
+            message: "CORS origin not allowed"
+        });
+    }
+
+    res.status(500).json({
+        success: false,
+        message: "Internal server error"
+    });
 });
 
 // =============================================
 // START SERVER
 // =============================================
+
 const PORT = process.env.PORT || 5000;
 
 app.listen(PORT, () => {
-  console.log(`🚀 Server Running on http://localhost:${PORT}`);
-  console.log(`📊 Health: http://localhost:${PORT}/api/health`);
-  console.log(`👤 Users: http://localhost:${PORT}/api/personal-users/all`);
-  console.log(`🔐 Auth: http://localhost:${PORT}/api/auth/login`);
-  console.log(`📋 API Routes:`);
-  console.log(`   POST   /api/auth/login`);
-  console.log(`   POST   /api/auth/register`);
-  console.log(`   POST   /api/auth/send-otp`);
-  console.log(`   POST   /api/auth/verify-otp`);
-  console.log(`   POST   /api/auth/forgot/send-otp`);
-  console.log(`   POST   /api/auth/forgot/verify-otp`);
-  console.log(`   POST   /api/auth/forgot/reset-password`);
-  console.log(`   GET    /api/auth/profile/:id`);
+    console.log(`🚀 Server Running on port ${PORT}`);
 });
