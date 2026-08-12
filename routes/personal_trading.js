@@ -1,5 +1,5 @@
 // personal_trading.js - CommonJS
-// Professional Personal Trading API
+// Professional Personal Trading API with Export Functionality
 
 const express = require("express");
 const router = express.Router();
@@ -2189,6 +2189,1503 @@ router.get(
                 error:
                     err.message
             });
+        }
+    }
+);
+
+// =============================================
+// =============================================
+// PROFESSIONAL REPORT EXPORT API
+// =============================================
+
+// =============================================
+// CREATE REPORT DATE RANGE
+// =============================================
+
+const createReportDateRange = (period, dateValue, monthValue) => {
+    let startDate;
+    let endDate;
+
+    if (period === "daily") {
+        if (!dateValue || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+            throw new Error("Daily report requires date=YYYY-MM-DD");
+        }
+
+        const date = new Date(`${dateValue}T00:00:00`);
+
+        if (Number.isNaN(date.getTime())) {
+            throw new Error("Invalid daily report date");
+        }
+
+        startDate = new Date(
+            date.getFullYear(),
+            date.getMonth(),
+            date.getDate()
+        );
+
+        endDate = new Date(startDate);
+        endDate.setDate(endDate.getDate() + 1);
+
+    } else if (period === "weekly") {
+        if (!dateValue || !/^\d{4}-\d{2}-\d{2}$/.test(dateValue)) {
+            throw new Error("Weekly report requires date=YYYY-MM-DD");
+        }
+
+        const selected = new Date(`${dateValue}T00:00:00`);
+
+        if (Number.isNaN(selected.getTime())) {
+            throw new Error("Invalid weekly report date");
+        }
+
+        const dayOfWeek = selected.getDay();
+
+        const diff =
+            selected.getDate() -
+            dayOfWeek +
+            (dayOfWeek === 0 ? -6 : 1);
+
+        startDate = new Date(
+            selected.getFullYear(),
+            selected.getMonth(),
+            diff
+        );
+
+        endDate = new Date(startDate);
+        endDate.setDate(startDate.getDate() + 7);
+
+    } else {
+        if (!monthValue || !/^\d{4}-\d{2}$/.test(monthValue)) {
+            throw new Error("Monthly report requires month=YYYY-MM");
+        }
+
+        const [year, month] = monthValue
+            .split("-")
+            .map(Number);
+
+        startDate = new Date(year, month - 1, 1);
+        endDate = new Date(year, month, 1);
+    }
+
+    return {
+        startDate,
+        endDate
+    };
+};
+
+// =============================================
+// FORMAT HELPERS
+// =============================================
+
+const exportNumber = (value) => {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+        return 0;
+    }
+
+    return Math.round(
+        (number + Number.EPSILON) * 100
+    ) / 100;
+};
+
+const exportCurrency = (value) => {
+    const number = exportNumber(value);
+
+    return `₹${number.toLocaleString("en-IN", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: 2
+    })}`;
+};
+
+const exportDate = (value) => {
+    if (!value) {
+        return "";
+    }
+
+    const date = new Date(
+        `${String(value).slice(0, 10)}T00:00:00`
+    );
+
+    if (Number.isNaN(date.getTime())) {
+        return String(value);
+    }
+
+    return date.toLocaleDateString("en-IN", {
+        day: "2-digit",
+        month: "short",
+        year: "numeric"
+    });
+};
+
+const exportSafeText = (value) => {
+    return String(value ?? "")
+        .replace(/\r?\n/g, " ")
+        .trim();
+};
+
+// =============================================
+// GET EXPORT REPORT DATA
+// =============================================
+
+const getExportReportData = async (
+    userId,
+    period,
+    dateValue,
+    monthValue
+) => {
+
+    const {
+        startDate,
+        endDate
+    } = createReportDateRange(
+        period,
+        dateValue,
+        monthValue
+    );
+
+    const result = await db.query(
+        `
+        SELECT
+            id,
+            user_id,
+            date,
+            broker,
+            segment,
+            name,
+            type,
+            quantity,
+            entry_price,
+            exit_price,
+            gross_profit_loss,
+            brokerage,
+            profit_loss,
+            status,
+            notes,
+            calculation_mode,
+            profit_amount,
+            loss_amount,
+            created_at,
+            updated_at
+        FROM personal_trading
+        WHERE user_id = $1
+          AND date >= $2
+          AND date < $3
+        ORDER BY
+            date DESC,
+            created_at DESC
+        `,
+        [
+            userId,
+            startDate,
+            endDate
+        ]
+    );
+
+    const trades = result.rows;
+
+    let totalProfit = 0;
+    let totalLoss = 0;
+    let totalGrossProfit = 0;
+    let totalGrossLoss = 0;
+    let totalBrokerage = 0;
+    let netProfit = 0;
+
+    let winningTrades = 0;
+    let losingTrades = 0;
+    let breakEvenTrades = 0;
+
+    const dailyMap = {};
+
+    trades.forEach((trade) => {
+
+        const net =
+            exportNumber(trade.profit_loss);
+
+        const gross =
+            exportNumber(trade.gross_profit_loss);
+
+        const brokerage =
+            Math.max(
+                0,
+                exportNumber(trade.brokerage)
+            );
+
+        if (net > 0) {
+            totalProfit += net;
+            winningTrades++;
+        } else if (net < 0) {
+            totalLoss += Math.abs(net);
+            losingTrades++;
+        } else {
+            breakEvenTrades++;
+        }
+
+        if (gross > 0) {
+            totalGrossProfit += gross;
+        } else if (gross < 0) {
+            totalGrossLoss += Math.abs(gross);
+        }
+
+        totalBrokerage += brokerage;
+        netProfit += net;
+
+        const dateKey =
+            String(trade.date).slice(0, 10);
+
+        if (!dailyMap[dateKey]) {
+            dailyMap[dateKey] = {
+                profit: 0,
+                loss: 0,
+                net: 0,
+                brokerage: 0,
+                trades: 0
+            };
+        }
+
+        dailyMap[dateKey].trades += 1;
+        dailyMap[dateKey].net += net;
+        dailyMap[dateKey].brokerage += brokerage;
+
+        if (net > 0) {
+            dailyMap[dateKey].profit += net;
+        }
+
+        if (net < 0) {
+            dailyMap[dateKey].loss += Math.abs(net);
+        }
+    });
+
+    const decidedTrades =
+        winningTrades + losingTrades;
+
+    const winRate =
+        decidedTrades > 0
+            ? (winningTrades / decidedTrades) * 100
+            : 0;
+
+    const profitFactor =
+        totalLoss > 0
+            ? totalProfit / totalLoss
+            : totalProfit > 0
+                ? null
+                : 0;
+
+    const daily = Object.keys(dailyMap)
+        .sort()
+        .map((date) => ({
+            date,
+            profit: exportNumber(
+                dailyMap[date].profit
+            ),
+            loss: exportNumber(
+                dailyMap[date].loss
+            ),
+            net: exportNumber(
+                dailyMap[date].net
+            ),
+            brokerage: exportNumber(
+                dailyMap[date].brokerage
+            ),
+            trades:
+                dailyMap[date].trades
+        }));
+
+    return {
+        trades,
+
+        summary: {
+            totalTrades: trades.length,
+            winningTrades,
+            losingTrades,
+            breakEvenTrades,
+            decidedTrades,
+
+            totalProfit:
+                exportNumber(totalProfit),
+
+            totalLoss:
+                exportNumber(totalLoss),
+
+            netProfit:
+                exportNumber(netProfit),
+
+            totalGrossProfit:
+                exportNumber(totalGrossProfit),
+
+            totalGrossLoss:
+                exportNumber(totalGrossLoss),
+
+            totalBrokerage:
+                exportNumber(totalBrokerage),
+
+            winRate:
+                exportNumber(winRate),
+
+            profitFactor:
+                profitFactor === null
+                    ? null
+                    : exportNumber(profitFactor)
+        },
+
+        daily
+    };
+};
+
+// =============================================
+// REPORT TITLE
+// =============================================
+
+const getExportReportTitle = (
+    period,
+    dateValue,
+    monthValue
+) => {
+
+    if (period === "daily") {
+        return `Daily Trading Report - ${dateValue}`;
+    }
+
+    if (period === "weekly") {
+        return `Weekly Trading Report - ${dateValue}`;
+    }
+
+    return `Monthly Trading Report - ${monthValue}`;
+};
+
+// =============================================
+// TEXT REPORT
+// =============================================
+
+const createTextReport = (
+    title,
+    report
+) => {
+
+    const lines = [];
+
+    lines.push(
+        "============================================================"
+    );
+
+    lines.push(
+        "                    TRADING JOURNAL"
+    );
+
+    lines.push(
+        "                   PROFESSIONAL REPORT"
+    );
+
+    lines.push(
+        "============================================================"
+    );
+
+    lines.push("");
+
+    lines.push(`Report: ${title}`);
+
+    lines.push(
+        `Generated: ${new Date().toLocaleString("en-IN")}`
+    );
+
+    lines.push("");
+
+    lines.push(
+        "-------------------- SUMMARY --------------------"
+    );
+
+    lines.push(
+        `Total Trades      : ${report.summary.totalTrades}`
+    );
+
+    lines.push(
+        `Winning Trades    : ${report.summary.winningTrades}`
+    );
+
+    lines.push(
+        `Losing Trades     : ${report.summary.losingTrades}`
+    );
+
+    lines.push(
+        `Break-even Trades : ${report.summary.breakEvenTrades}`
+    );
+
+    lines.push(
+        `Win Rate          : ${report.summary.winRate.toFixed(2)}%`
+    );
+
+    lines.push(
+        `Gross Profit      : ${exportCurrency(report.summary.totalGrossProfit)}`
+    );
+
+    lines.push(
+        `Gross Loss        : ${exportCurrency(report.summary.totalGrossLoss)}`
+    );
+
+    lines.push(
+        `Brokerage         : ${exportCurrency(report.summary.totalBrokerage)}`
+    );
+
+    lines.push(
+        `Net Profit/Loss   : ${exportCurrency(report.summary.netProfit)}`
+    );
+
+    lines.push(
+        `Profit Factor     : ${
+            report.summary.profitFactor === null
+                ? "∞"
+                : report.summary.profitFactor.toFixed(2)
+        }`
+    );
+
+    lines.push("");
+
+    lines.push(
+        "-------------------- DAILY P&L --------------------"
+    );
+
+    lines.push(
+        "Date | Trades | Profit | Loss | Brokerage | Net P&L"
+    );
+
+    lines.push(
+        "----------------------------------------------------"
+    );
+
+    report.daily.forEach((item) => {
+
+        lines.push(
+            [
+                item.date,
+                item.trades,
+                exportCurrency(item.profit),
+                exportCurrency(item.loss),
+                exportCurrency(item.brokerage),
+                exportCurrency(item.net)
+            ].join(" | ")
+        );
+    });
+
+    lines.push("");
+
+    lines.push(
+        "-------------------- TRADE DETAILS --------------------"
+    );
+
+    lines.push("");
+
+    report.trades.forEach((trade, index) => {
+
+        lines.push(
+            `Trade #${index + 1}`
+        );
+
+        lines.push(
+            `Date        : ${exportDate(trade.date)}`
+        );
+
+        lines.push(
+            `Market      : ${trade.segment || ""}`
+        );
+
+        lines.push(
+            `Broker      : ${trade.broker || ""}`
+        );
+
+        lines.push(
+            `Name        : ${trade.name || ""}`
+        );
+
+        lines.push(
+            `Type        : ${trade.type || ""}`
+        );
+
+        lines.push(
+            `Lot Size    : ${exportNumber(trade.quantity)}`
+        );
+
+        lines.push(
+            `Entry       : ${exportNumber(trade.entry_price)}`
+        );
+
+        lines.push(
+            `Exit        : ${exportNumber(trade.exit_price)}`
+        );
+
+        lines.push(
+            `Gross       : ${exportCurrency(trade.gross_profit_loss)}`
+        );
+
+        lines.push(
+            `Brokerage   : ${exportCurrency(trade.brokerage)}`
+        );
+
+        lines.push(
+            `Net P&L     : ${exportCurrency(trade.profit_loss)}`
+        );
+
+        lines.push(
+            `Status      : ${trade.status || ""}`
+        );
+
+        lines.push(
+            `Notes       : ${exportSafeText(trade.notes)}`
+        );
+
+        lines.push(
+            "----------------------------------------------------"
+        );
+    });
+
+    lines.push("");
+
+    lines.push(
+        "Generated by Personal Trading Journal"
+    );
+
+    return lines.join("\n");
+};
+
+// =============================================
+// EXCEL REPORT
+// =============================================
+
+const createExcelReport = async (
+    title,
+    report
+) => {
+
+    let ExcelJS;
+
+    try {
+        ExcelJS = require("exceljs");
+    } catch {
+        throw new Error(
+            "ExcelJS is not installed. Run: npm install exceljs"
+        );
+    }
+
+    const workbook =
+        new ExcelJS.Workbook();
+
+    workbook.creator =
+        "Personal Trading Journal";
+
+    workbook.lastModifiedBy =
+        "Personal Trading Journal";
+
+    workbook.created =
+        new Date();
+
+    workbook.modified =
+        new Date();
+
+    const sheet =
+        workbook.addWorksheet(
+            "Trading Report",
+            {
+                views: [
+                    {
+                        state: "frozen",
+                        ySplit: 7
+                    }
+                ]
+            }
+        );
+
+    sheet.mergeCells(
+        "A1:M1"
+    );
+
+    sheet.getCell("A1").value =
+        "TRADING JOURNAL REPORT";
+
+    sheet.getCell("A1").font = {
+        bold: true,
+        size: 18,
+        color: {
+            argb: "FFFFFFFF"
+        }
+    };
+
+    sheet.getCell("A1").alignment = {
+        horizontal: "center",
+        vertical: "middle"
+    };
+
+    sheet.getCell("A1").fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+            argb: "FF1F2937"
+        }
+    };
+
+    sheet.getRow(1).height = 30;
+
+    sheet.mergeCells(
+        "A2:M2"
+    );
+
+    sheet.getCell("A2").value =
+        title;
+
+    sheet.getCell("A2").font = {
+        bold: true,
+        size: 11,
+        color: {
+            argb: "FF374151"
+        }
+    };
+
+    sheet.mergeCells(
+        "A3:M3"
+    );
+
+    sheet.getCell("A3").value =
+        `Generated: ${new Date().toLocaleString("en-IN")}`;
+
+    sheet.getCell("A3").font = {
+        size: 9,
+        color: {
+            argb: "FF6B7280"
+        }
+    };
+
+    // Summary
+    sheet.mergeCells(
+        "A5:M5"
+    );
+
+    sheet.getCell("A5").value =
+        "SUMMARY";
+
+    sheet.getCell("A5").font = {
+        bold: true,
+        color: {
+            argb: "FFFFFFFF"
+        }
+    };
+
+    sheet.getCell("A5").fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+            argb: "FF4F46E5"
+        }
+    };
+
+    const summaryRows = [
+        [
+            "Total Trades",
+            report.summary.totalTrades
+        ],
+        [
+            "Winning Trades",
+            report.summary.winningTrades
+        ],
+        [
+            "Losing Trades",
+            report.summary.losingTrades
+        ],
+        [
+            "Break-even Trades",
+            report.summary.breakEvenTrades
+        ],
+        [
+            "Win Rate",
+            `${report.summary.winRate.toFixed(2)}%`
+        ],
+        [
+            "Gross Profit",
+            exportCurrency(
+                report.summary.totalGrossProfit
+            )
+        ],
+        [
+            "Gross Loss",
+            exportCurrency(
+                report.summary.totalGrossLoss
+            )
+        ],
+        [
+            "Brokerage",
+            exportCurrency(
+                report.summary.totalBrokerage
+            )
+        ],
+        [
+            "Net P&L",
+            exportCurrency(
+                report.summary.netProfit
+            )
+        ],
+        [
+            "Profit Factor",
+            report.summary.profitFactor === null
+                ? "∞"
+                : report.summary.profitFactor.toFixed(2)
+        ]
+    ];
+
+    let summaryRowNumber = 6;
+
+    summaryRows.forEach(
+        ([label, value]) => {
+
+            sheet.getCell(
+                `A${summaryRowNumber}`
+            ).value = label;
+
+            sheet.getCell(
+                `B${summaryRowNumber}`
+            ).value = value;
+
+            sheet.getCell(
+                `A${summaryRowNumber}`
+            ).font = {
+                bold: true
+            };
+
+            summaryRowNumber++;
+        }
+    );
+
+    const headerRow =
+        summaryRowNumber + 1;
+
+    sheet.mergeCells(
+        `A${headerRow}:M${headerRow}`
+    );
+
+    sheet.getCell(
+        `A${headerRow}`
+    ).value =
+        "TRADE DETAILS";
+
+    sheet.getCell(
+        `A${headerRow}`
+    ).font = {
+        bold: true,
+        color: {
+            argb: "FFFFFFFF"
+        }
+    };
+
+    sheet.getCell(
+        `A${headerRow}`
+    ).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+            argb: "FF111827"
+        }
+    };
+
+    const tableHeaderRow =
+        headerRow + 1;
+
+    const columns = [
+        "Date",
+        "Market",
+        "Name",
+        "Broker",
+        "Segment",
+        "Type",
+        "Lot Size",
+        "Entry",
+        "Exit",
+        "Gross",
+        "Brokerage",
+        "Net P&L",
+        "Status"
+    ];
+
+    sheet.getRow(
+        tableHeaderRow
+    ).values = columns;
+
+    sheet.getRow(
+        tableHeaderRow
+    ).font = {
+        bold: true,
+        color: {
+            argb: "FFFFFFFF"
+        }
+    };
+
+    sheet.getRow(
+        tableHeaderRow
+    ).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+            argb: "FF374151"
+        }
+    };
+
+    report.trades.forEach(
+        (trade) => {
+
+            const row =
+                sheet.addRow([
+                    exportDate(trade.date),
+                    trade.segment || "",
+                    trade.name || "",
+                    trade.broker || "",
+                    trade.segment || "",
+                    trade.type || "",
+                    exportNumber(trade.quantity),
+                    exportNumber(trade.entry_price),
+                    exportNumber(trade.exit_price),
+                    exportNumber(trade.gross_profit_loss),
+                    exportNumber(trade.brokerage),
+                    exportNumber(trade.profit_loss),
+                    trade.status || ""
+                ]);
+
+            row.eachCell(
+                (cell) => {
+                    cell.border = {
+                        top: {
+                            style: "thin",
+                            color: {
+                                argb: "FFD1D5DB"
+                            }
+                        },
+                        left: {
+                            style: "thin",
+                            color: {
+                                argb: "FFD1D5DB"
+                            }
+                        },
+                        bottom: {
+                            style: "thin",
+                            color: {
+                                argb: "FFD1D5DB"
+                            }
+                        },
+                        right: {
+                            style: "thin",
+                            color: {
+                                argb: "FFD1D5DB"
+                            }
+                        }
+                    };
+                }
+            );
+
+            const netCell =
+                row.getCell(12);
+
+            if (
+                Number(trade.profit_loss) > 0
+            ) {
+                netCell.font = {
+                    bold: true,
+                    color: {
+                        argb: "FF059669"
+                    }
+                };
+            }
+
+            if (
+                Number(trade.profit_loss) < 0
+            ) {
+                netCell.font = {
+                    bold: true,
+                    color: {
+                        argb: "FFDC2626"
+                    }
+                };
+            }
+        }
+    );
+
+    const widths = [
+        14,
+        14,
+        22,
+        16,
+        16,
+        10,
+        12,
+        14,
+        14,
+        15,
+        15,
+        15,
+        14
+    ];
+
+    widths.forEach(
+        (width, index) => {
+            sheet.getColumn(
+                index + 1
+            ).width = width;
+        }
+    );
+
+    // Daily chart sheet
+    const chartSheet =
+        workbook.addWorksheet(
+            "Daily P&L"
+        );
+
+    chartSheet.addRow([
+        "Date",
+        "Trades",
+        "Profit",
+        "Loss",
+        "Brokerage",
+        "Net P&L"
+    ]);
+
+    chartSheet.getRow(1).font = {
+        bold: true,
+        color: {
+            argb: "FFFFFFFF"
+        }
+    };
+
+    chartSheet.getRow(1).fill = {
+        type: "pattern",
+        pattern: "solid",
+        fgColor: {
+            argb: "FF111827"
+        }
+    };
+
+    report.daily.forEach(
+        (day) => {
+            chartSheet.addRow([
+                day.date,
+                day.trades,
+                day.profit,
+                day.loss,
+                day.brokerage,
+                day.net
+            ]);
+        }
+    );
+
+    chartSheet.columns.forEach(
+        (column) => {
+            column.width = 16;
+        }
+    );
+
+    return workbook.xlsx.writeBuffer();
+};
+
+// =============================================
+// PDF REPORT
+// =============================================
+
+const createPdfReport = (
+    title,
+    report,
+    res
+) => {
+
+    let PDFDocument;
+
+    try {
+        PDFDocument = require("pdfkit");
+    } catch {
+        throw new Error(
+            "PDFKit is not installed. Run: npm install pdfkit"
+        );
+    }
+
+    const doc =
+        new PDFDocument({
+            size: "A4",
+            layout: "landscape",
+            margins: {
+                top: 36,
+                bottom: 36,
+                left: 32,
+                right: 32
+            }
+        });
+
+    res.setHeader(
+        "Content-Type",
+        "application/pdf"
+    );
+
+    res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${title
+            .replace(/[^a-z0-9]+/gi, "-")
+            .toLowerCase()}.pdf"`
+    );
+
+    doc.pipe(res);
+
+    doc
+        .fontSize(20)
+        .fillColor("#111827")
+        .text(
+            "TRADING JOURNAL REPORT",
+            {
+                align: "center"
+            }
+        );
+
+    doc
+        .moveDown(0.3)
+        .fontSize(11)
+        .fillColor("#4B5563")
+        .text(
+            title,
+            {
+                align: "center"
+            }
+        );
+
+    doc
+        .moveDown(0.2)
+        .fontSize(8)
+        .fillColor("#6B7280")
+        .text(
+            `Generated: ${new Date().toLocaleString("en-IN")}`,
+            {
+                align: "center"
+            }
+        );
+
+    doc.moveDown(1);
+
+    // Summary boxes
+    const summary = report.summary;
+
+    const summaryItems = [
+        ["Trades", summary.totalTrades],
+        ["Win Rate", `${summary.winRate.toFixed(2)}%`],
+        ["Gross Profit", exportCurrency(summary.totalGrossProfit)],
+        ["Gross Loss", exportCurrency(summary.totalGrossLoss)],
+        ["Brokerage", exportCurrency(summary.totalBrokerage)],
+        ["Net P&L", exportCurrency(summary.netProfit)]
+    ];
+
+    const boxWidth = 120;
+    const boxHeight = 52;
+    const gap = 12;
+
+    let x =
+        doc.page.margins.left;
+
+    const y =
+        doc.y;
+
+    summaryItems.forEach(
+        ([label, value]) => {
+
+            doc.roundedRect(
+                x,
+                y,
+                boxWidth,
+                boxHeight,
+                8
+            )
+                .fillAndStroke(
+                    "#F8FAFC",
+                    "#CBD5E1"
+                );
+
+            doc
+                .fontSize(7)
+                .fillColor("#64748B")
+                .text(
+                    label,
+                    x + 8,
+                    y + 8,
+                    {
+                        width: boxWidth - 16,
+                        align: "center"
+                    }
+                );
+
+            doc
+                .fontSize(12)
+                .fillColor(
+                    label === "Net P&L"
+                        ? summary.netProfit >= 0
+                            ? "#059669"
+                            : "#DC2626"
+                        : "#111827"
+                )
+                .text(
+                    String(value),
+                    x + 8,
+                    y + 25,
+                    {
+                        width: boxWidth - 16,
+                        align: "center"
+                    }
+                );
+
+            x +=
+                boxWidth + gap;
+        }
+    );
+
+    doc.y =
+        y + boxHeight + 22;
+
+    // Table
+    const tableHeaders = [
+        "Date",
+        "Market",
+        "Name",
+        "Broker",
+        "Type",
+        "Lot",
+        "Entry",
+        "Exit",
+        "Gross",
+        "Brokerage",
+        "Net P&L",
+        "Status"
+    ];
+
+    const tableX =
+        doc.page.margins.left;
+
+    const tableWidth =
+        doc.page.width -
+        doc.page.margins.left -
+        doc.page.margins.right;
+
+    const columnWidth =
+        tableWidth /
+        tableHeaders.length;
+
+    let tableY =
+        doc.y;
+
+    const drawHeader = () => {
+
+        doc
+            .rect(
+                tableX,
+                tableY,
+                tableWidth,
+                22
+            )
+            .fill("#111827");
+
+        tableHeaders.forEach(
+            (header, index) => {
+
+                doc
+                    .fontSize(6.5)
+                    .fillColor("#FFFFFF")
+                    .text(
+                        header,
+                        tableX +
+                            index *
+                            columnWidth +
+                            3,
+                        tableY + 7,
+                        {
+                            width:
+                                columnWidth - 6,
+                            align: "center",
+                            lineBreak: false
+                        }
+                    );
+            }
+        );
+
+        tableY += 22;
+    };
+
+    drawHeader();
+
+    report.trades.forEach(
+        (trade, index) => {
+
+            if (
+                tableY >
+                doc.page.height - 55
+            ) {
+                doc.addPage({
+                    size: "A4",
+                    layout: "landscape",
+                    margins: {
+                        top: 36,
+                        bottom: 36,
+                        left: 32,
+                        right: 32
+                    }
+                });
+
+                tableY = 36;
+
+                drawHeader();
+            }
+
+            const rowHeight = 22;
+
+            if (index % 2 === 0) {
+                doc
+                    .rect(
+                        tableX,
+                        tableY,
+                        tableWidth,
+                        rowHeight
+                    )
+                    .fill("#F8FAFC");
+            }
+
+            const values = [
+                exportDate(trade.date),
+                trade.segment || "",
+                exportSafeText(trade.name),
+                exportSafeText(trade.broker),
+                trade.type || "",
+                exportNumber(trade.quantity),
+                exportNumber(trade.entry_price),
+                exportNumber(trade.exit_price),
+                exportCurrency(trade.gross_profit_loss),
+                exportCurrency(trade.brokerage),
+                exportCurrency(trade.profit_loss),
+                trade.status || ""
+            ];
+
+            values.forEach(
+                (value, columnIndex) => {
+
+                    const color =
+                        columnIndex === 10
+                            ? Number(trade.profit_loss) >= 0
+                                ? "#059669"
+                                : "#DC2626"
+                            : "#111827";
+
+                    doc
+                        .fontSize(6.2)
+                        .fillColor(color)
+                        .text(
+                            String(value),
+                            tableX +
+                                columnIndex *
+                                columnWidth +
+                                3,
+                            tableY + 7,
+                            {
+                                width:
+                                    columnWidth - 6,
+                                align: "center",
+                                lineBreak: false
+                            }
+                        );
+                }
+            );
+
+            doc
+                .rect(
+                    tableX,
+                    tableY,
+                    tableWidth,
+                    rowHeight
+                )
+                .strokeColor("#E5E7EB")
+                .lineWidth(0.5)
+                .stroke();
+
+            tableY += rowHeight;
+        }
+    );
+
+    doc
+        .fontSize(7)
+        .fillColor("#6B7280")
+        .text(
+            "Generated by Personal Trading Journal",
+            tableX,
+            doc.page.height - 28,
+            {
+                width: tableWidth,
+                align: "center"
+            }
+        );
+
+    doc.end();
+};
+
+// =============================================
+// EXPORT ROUTE
+// GET /api/personal-trading/export/:user_id
+// =============================================
+
+router.get(
+    "/export/:user_id",
+    async (req, res) => {
+
+        try {
+
+            if (!db) {
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        "Database connection not available"
+                });
+            }
+
+            const userId =
+                req.params.user_id;
+
+            if (!userId) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "user_id is required"
+                });
+            }
+
+            const period =
+                String(
+                    req.query.period || "monthly"
+                ).toLowerCase();
+
+            const format =
+                String(
+                    req.query.format || "excel"
+                ).toLowerCase();
+
+            const dateValue =
+                req.query.date;
+
+            const monthValue =
+                req.query.month;
+
+            if (
+                !["daily", "weekly", "monthly"]
+                    .includes(period)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid period. Use daily, weekly or monthly."
+                });
+            }
+
+            if (
+                !["pdf", "excel", "text"]
+                    .includes(format)
+            ) {
+                return res.status(400).json({
+                    success: false,
+                    message:
+                        "Invalid format. Use pdf, excel or text."
+                });
+            }
+
+            const report =
+                await getExportReportData(
+                    userId,
+                    period,
+                    dateValue,
+                    monthValue
+                );
+
+            const title =
+                getExportReportTitle(
+                    period,
+                    dateValue,
+                    monthValue
+                );
+
+            // -------------------------------
+            // TEXT
+            // -------------------------------
+
+            if (format === "text") {
+
+                const content =
+                    createTextReport(
+                        title,
+                        report
+                    );
+
+                const filename =
+                    `${period}-trading-report-${new Date()
+                        .toISOString()
+                        .slice(0, 10)}.txt`;
+
+                res.setHeader(
+                    "Content-Type",
+                    "text/plain; charset=utf-8"
+                );
+
+                res.setHeader(
+                    "Content-Disposition",
+                    `attachment; filename="${filename}"`
+                );
+
+                return res.send(content);
+            }
+
+            // -------------------------------
+            // EXCEL
+            // -------------------------------
+
+            if (format === "excel") {
+
+                const buffer =
+                    await createExcelReport(
+                        title,
+                        report
+                    );
+
+                const filename =
+                    `${period}-trading-report-${new Date()
+                        .toISOString()
+                        .slice(0, 10)}.xlsx`;
+
+                res.setHeader(
+                    "Content-Type",
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                );
+
+                res.setHeader(
+                    "Content-Disposition",
+                    `attachment; filename="${filename}"`
+                );
+
+                return res.end(buffer);
+            }
+
+            // -------------------------------
+            // PDF
+            // -------------------------------
+
+            return createPdfReport(
+                title,
+                report,
+                res
+            );
+
+        } catch (err) {
+
+            console.error(
+                "❌ Export report error:",
+                err
+            );
+
+            if (!res.headersSent) {
+                return res.status(500).json({
+                    success: false,
+                    message:
+                        err.message ||
+                        "Failed to export report"
+                });
+            }
+
+            return res.end();
         }
     }
 );
