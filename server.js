@@ -4,13 +4,24 @@ require("dotenv").config();
 
 const db = require("./db");
 
-// Routes
-const personalUserRoutes = require("./routes/personal_user");
-const personalOverviewRoutes = require("./routes/personal_overview");
-const personalTradingRoutes = require("./routes/personal_trading");
+// ================================
+// API ROUTE IMPORTS
+// ================================
+
+// Authentication
+// NOTE: Keep this import if authRoutes is already available
+// in your project.
 const authRoutes = require("./routes/auth");
-const personalTransactionsRoutes = require("./routes/personal_transactions");
-const personalLoansRoutes = require("./routes/personal_loans");
+
+// Personal Dashboard APIs
+const personalUserRoutes = require("./routes/personal_user");
+const overviewRoutes = require("./routes/overviewApi");
+const expenseRoutes = require("./routes/expenseApi");
+const loanBorrowRoutes = require("./routes/loanBorrowApi");
+const paymentRoutes = require("./routes/paymentApi");
+const performanceRoutes = require("./routes/performanceApi");
+const summaryRoutes = require("./routes/summaryApi");
+const exportDetailsRoutes = require("./routes/exportDetailsApi");
 
 const app = express();
 
@@ -29,7 +40,10 @@ if (process.env.CLIENT_URL) {
         .trim()
         .replace(/\/$/, "");
 
-    if (clientUrl && !allowedOrigins.includes(clientUrl)) {
+    if (
+        clientUrl &&
+        !allowedOrigins.includes(clientUrl)
+    ) {
         allowedOrigins.push(clientUrl);
     }
 }
@@ -51,7 +65,10 @@ app.use(
                 return callback(null, true);
             }
 
-            console.log("CORS blocked:", cleanOrigin);
+            console.log(
+                "CORS blocked:",
+                cleanOrigin
+            );
 
             return callback(
                 new Error("Not allowed by CORS")
@@ -109,28 +126,48 @@ app.use(
     personalUserRoutes
 );
 
-// Personal Overview
+// ================================
+// PERSONAL DASHBOARD API ENDPOINTS
+// ================================
+
 app.use(
-    "/api/personal-overview",
-    personalOverviewRoutes
+    "/api/personal-user",
+    personalUserRoutes
 );
 
-// Personal Trading
 app.use(
-    "/api/personal-trading",
-    personalTradingRoutes
+    "/api/overview",
+    overviewRoutes
 );
 
-// Personal Transactions
 app.use(
-    "/api/personal-transactions",
-    personalTransactionsRoutes
+    "/api/expenses",
+    expenseRoutes
 );
 
-// Personal Loans
 app.use(
-    "/api/personal-loans",
-    personalLoansRoutes
+    "/api/loan-borrow",
+    loanBorrowRoutes
+);
+
+app.use(
+    "/api/payments",
+    paymentRoutes
+);
+
+app.use(
+    "/api/performance",
+    performanceRoutes
+);
+
+app.use(
+    "/api/summary",
+    summaryRoutes
+);
+
+app.use(
+    "/api/export-details",
+    exportDetailsRoutes
 );
 
 // =============================================
@@ -159,7 +196,8 @@ app.use(
 
         res.status(404).json({
             success: false,
-            message: `Route not found: ${req.method} ${req.path}`
+            message:
+                `Route not found: ${req.method} ${req.path}`
         });
 
     }
@@ -184,14 +222,16 @@ app.use(
 
             return res.status(403).json({
                 success: false,
-                message: "CORS origin not allowed"
+                message:
+                    "CORS origin not allowed"
             });
 
         }
 
         res.status(500).json({
             success: false,
-            message: "Internal server error"
+            message:
+                "Internal server error"
         });
 
     }

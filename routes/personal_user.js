@@ -193,7 +193,7 @@ const createTable = async () => {
   
   try {
     await db.query(`
-      CREATE TABLE IF NOT EXISTS Personal_users (
+      CREATE TABLE IF NOT EXISTS personal_users (
         id SERIAL PRIMARY KEY,
         full_name VARCHAR(150) NOT NULL,
         profession VARCHAR(150),
@@ -203,7 +203,7 @@ const createTable = async () => {
         email1 VARCHAR(150),
         email2 VARCHAR(150),
         username VARCHAR(150) UNIQUE,
-        email_address VARCHAR(150) UNIQUE,
+        email_address VARCHAR(150) UNIQUE NOT NULL,
         password_hash VARCHAR(255) NOT NULL,
         email_verified BOOLEAN DEFAULT FALSE,
         street TEXT,
@@ -217,7 +217,17 @@ const createTable = async () => {
         updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
       )
     `);
-    console.log('✅ Personal_users table ready');
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_personal_users_email
+      ON personal_users(email_address)
+    `);
+
+    await db.query(`
+      CREATE INDEX IF NOT EXISTS idx_personal_users_username
+      ON personal_users(username)
+    `);
+
+    console.log('✅ Personal_users table and indexes ready');
 
     // Create OTP table
     await db.query(`
