@@ -15,13 +15,23 @@ const authRoutes = require("./routes/auth");
 
 // Personal Dashboard APIs
 const personalUserRoutes = require("./routes/personal_user");
-const overviewRoutes = require("./routes/overviewApi");
-const expenseRoutes = require("./routes/expenseApi");
-const loanBorrowRoutes = require("./routes/loanBorrowApi");
-const paymentRoutes = require("./routes/paymentApi");
-const performanceRoutes = require("./routes/performanceApi");
-const summaryRoutes = require("./routes/summaryApi");
-const exportDetailsRoutes = require("./routes/exportDetailsApi");
+const overviewRoutes = require("./routes/overviewapi");
+const expenseRoutes = require("./routes/expenseapi");
+const loanBorrowRoutes = require("./routes/loanBorrowapi");
+const paymentRoutes = require("./routes/paymentapi");
+const performanceRoutes = require("./routes/performanceapi");
+const summaryRoutes = require("./routes/summaryapi");
+const exportDetailsRoutes = require("./routes/expenseapi");
+
+// =============================================
+// NEW PERSONAL APIs
+// =============================================
+
+const personalLoansRoutes = require("./routes/personal_loans");
+const personalTradingRoutes = require("./routes/personal_trading");
+const personalTransactionsRoutes = require("./routes/personal_transactions");
+
+
 
 const app = express();
 
@@ -36,6 +46,7 @@ const allowedOrigins = [
 ];
 
 if (process.env.CLIENT_URL) {
+
     const clientUrl = process.env.CLIENT_URL
         .trim()
         .replace(/\/$/, "");
@@ -46,6 +57,7 @@ if (process.env.CLIENT_URL) {
     ) {
         allowedOrigins.push(clientUrl);
     }
+
 }
 
 app.use(
@@ -168,6 +180,28 @@ app.use(
 app.use(
     "/api/export-details",
     exportDetailsRoutes
+);
+
+// =============================================
+// NEW PERSONAL API ENDPOINTS
+// =============================================
+
+// Personal Loans
+app.use(
+    "/api/personal-loans",
+    personalLoansRoutes
+);
+
+// Personal Trading
+app.use(
+    "/api/personal-trading",
+    personalTradingRoutes
+);
+
+// Personal Transactions
+app.use(
+    "/api/personal-transactions",
+    personalTransactionsRoutes
 );
 
 // =============================================
