@@ -10,7 +10,7 @@
 
   IMPORTANT:
     Mount this router with:
-      app.use("/api/export-details", require("./routes/exportDetailsapi"));
+      app.use("/api/export-details", exportDetailsRoutes);
 
     The application should already have its normal authentication
     middleware if it sets req.user.
@@ -32,7 +32,64 @@ const express = require("express");
 const PDFDocument = require("pdfkit");
 const ExcelJS = require("exceljs");
 
+
 const router = express.Router();
+
+/*
+  ROUTES WHEN MOUNTED AS:
+    app.use("/api/export-details", exportDetailsRoutes);
+
+  GET /api/export-details/health
+  GET /api/export-details/auth-check
+  GET /api/export-details/data?period=month&month=YYYY-MM
+  GET /api/export-details/data?period=week&month=YYYY-MM&week=1..4
+
+  GET /api/export-details?format=pdf&period=month&month=YYYY-MM
+  GET /api/export-details?format=excel&period=month&month=YYYY-MM
+  GET /api/export-details?format=text&period=month&month=YYYY-MM
+
+  Weekly export adds:
+    &week=1..4
+*/
+
+// -----------------------------------------------------------------------------
+// CORS
+// -----------------------------------------------------------------------------
+// This API is called by the React/Vercel frontend from another origin.
+// The frontend sends Authorization and x-user-id headers, so the browser
+// performs an OPTIONS preflight request. Without this middleware the browser
+// reports only: "Failed to fetch".
+//
+// No "cors" npm package is required.
+router.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  if (origin) {
+    // Echo the requesting origin instead of using "*" because the frontend
+    // uses credentials: "include".
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+  }
+
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Authorization, Content-Type, Accept, X-User-Id, X-Auth-User-Id, X-Userid"
+  );
+
+  res.setHeader(
+    "Access-Control-Allow-Methods",
+    "GET, OPTIONS"
+  );
+
+  res.setHeader("Cache-Control", "no-store");
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  next();
+});
 
 // -----------------------------------------------------------------------------
 // DATABASE
@@ -76,7 +133,7 @@ const db = require("../db");
 // Example:
 //
 //   app.use(authenticateToken);
-//   app.use("/api/export-details", require("./routes/exportDetailsapi"));
+//   app.use("/api/export-details", exportDetailsRoutes);
 //
 // If your login middleware already runs globally, req.user will be used.
 
@@ -165,7 +222,7 @@ function getUserIdFromBearerToken(req) {
   }
 
   const match =
-    /^Bearer\\s+(.+)$/i.exec(String(header).trim());
+    /^Bearer\s+(.+)$/i.exec(String(header).trim());
 
   if (!match) {
     return null;
@@ -247,7 +304,7 @@ function requireUser(req, res, next) {
     return res.status(401).json({
       success: false,
       message:
-        "User authentication required. Existing login user was not attached to this request.",
+        "User authentication required. Use the same logged-in user ID/session/token from the existing login.",
       code: "AUTH_USER_NOT_FOUND",
     });
   }
@@ -496,6 +553,14 @@ function normalizeRows(rows) {
 // -----------------------------------------------------------------------------
 // Useful for testing the existing login without changing the login page.
 // GET /api/export-details/auth-check
+router.get("/health", (req, res) => {
+  return res.json({
+    success: true,
+    service: "export-details",
+    status: "ok",
+  });
+});
+
 router.get("/auth-check", requireUser, (req, res) => {
   return res.json({
     success: true,
@@ -1062,7 +1127,10 @@ router.get("/data", requireUser, async (req, res) => {
     return res.status(error.status || 500).json({
       success: false,
       message:
-        error.message || "Failed to load export details.",
+        error.code === "ECONNREFUSED" || error.code === "ENOTFOUND"
+          ? "Database connection failed. Check the backend database configuration."
+          : error.message || "Failed to load export details.",
+      code: error.code || undefined,
     });
   }
 });

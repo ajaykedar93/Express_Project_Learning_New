@@ -4,13 +4,11 @@ require("dotenv").config();
 
 const db = require("./db");
 
-// ================================
+// ============================================================
 // API ROUTE IMPORTS
-// ================================
+// ============================================================
 
 // Authentication
-// NOTE: Keep this import if authRoutes is already available
-// in your project.
 const authRoutes = require("./routes/auth");
 
 // Personal Dashboard APIs
@@ -23,30 +21,30 @@ const performanceRoutes = require("./routes/performanceapi");
 const summaryRoutes = require("./routes/summaryapi");
 const exportDetailsRoutes = require("./routes/exportDetailsapi");
 
-// =============================================
-// NEW PERSONAL APIs
-// =============================================
-
-const personalLoansRoutes = require("./routes/personal_loans");
+// Personal Trading
 const personalTradingRoutes = require("./routes/personal_trading");
-const personalTransactionsRoutes = require("./routes/personal_transactions");
-
-
 
 const app = express();
 
-// =============================================
-// CORS
-// =============================================
+// ============================================================
+// BASIC APP SETTINGS
+// ============================================================
 
-const allowedOrigins = [
+app.disable("x-powered-by");
+
+// ============================================================
+// CORS
+// ============================================================
+
+const defaultAllowedOrigins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://react-learning-project-lime.vercel.app"
 ];
 
-if (process.env.CLIENT_URL) {
+const allowedOrigins = [...defaultAllowedOrigins];
 
+if (process.env.CLIENT_URL) {
     const clientUrl = process.env.CLIENT_URL
         .trim()
         .replace(/\/$/, "");
@@ -57,57 +55,83 @@ if (process.env.CLIENT_URL) {
     ) {
         allowedOrigins.push(clientUrl);
     }
-
 }
 
-app.use(
-    cors({
-        origin: function (origin, callback) {
+const cleanOrigin = (origin) => {
+    if (!origin) return "";
 
-            // Allow requests without Origin
-            if (!origin) {
-                return callback(null, true);
-            }
+    return String(origin)
+        .trim()
+        .replace(/\/$/, "");
+};
 
-            const cleanOrigin = origin
-                .trim()
-                .replace(/\/$/, "");
+const corsOptions = {
+    origin: function (origin, callback) {
+        // Requests without an Origin header:
+        // Postman, curl, server-to-server, health checks, etc.
+        if (!origin) {
+            return callback(null, true);
+        }
 
-            if (allowedOrigins.includes(cleanOrigin)) {
-                return callback(null, true);
-            }
+        const originValue = cleanOrigin(origin);
 
-            console.log(
-                "CORS blocked:",
-                cleanOrigin
-            );
+        if (allowedOrigins.includes(originValue)) {
+            return callback(null, true);
+        }
 
-            return callback(
-                new Error("Not allowed by CORS")
-            );
-        },
+        console.log(
+            "CORS blocked:",
+            originValue
+        );
 
-        credentials: true,
+        return callback(
+            new Error("Not allowed by CORS")
+        );
+    },
 
-        methods: [
-            "GET",
-            "POST",
-            "PUT",
-            "PATCH",
-            "DELETE",
-            "OPTIONS"
-        ],
+    credentials: true,
 
-        allowedHeaders: [
-            "Content-Type",
-            "Authorization"
-        ]
-    })
+    methods: [
+        "GET",
+        "POST",
+        "PUT",
+        "PATCH",
+        "DELETE",
+        "OPTIONS"
+    ],
+
+    allowedHeaders: [
+        "Accept",
+        "Content-Type",
+        "Authorization",
+        "X-User-Id",
+        "X-User-ID",
+        "X-Userid",
+        "X-Auth-User-Id",
+        "X-Auth-User-ID"
+    ],
+
+    exposedHeaders: [
+        "Content-Disposition",
+        "Content-Length"
+    ],
+
+    optionsSuccessStatus: 204
+};
+
+app.use(cors(corsOptions));
+
+// Explicit OPTIONS handling.
+// This is important for browser preflight requests when the frontend
+// sends Authorization / X-User-Id headers.
+app.options(
+    "*",
+    cors(corsOptions)
 );
 
-// =============================================
-// MIDDLEWARE
-// =============================================
+// ============================================================
+// BODY MIDDLEWARE
+// ============================================================
 
 app.use(
     express.json({
@@ -122,30 +146,50 @@ app.use(
     })
 );
 
-// =============================================
-// ROUTES
-// =============================================
+// ============================================================
+// REQUEST LOGGING
+// ============================================================
 
-// Authentication
+app.use((req, res, next) => {
+    const startedAt = Date.now();
+
+    res.on("finish", () => {
+        const duration = Date.now() - startedAt;
+
+        console.log(
+            `${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`
+        );
+    });
+
+    next();
+});
+
+// ============================================================
+// AUTHENTICATION
+// ============================================================
+
 app.use(
     "/api/auth",
     authRoutes
 );
 
-// Personal Users
+// ============================================================
+// PERSONAL USERS
+// ============================================================
+
 app.use(
     "/api/personal-users",
     personalUserRoutes
 );
 
-// ================================
-// PERSONAL DASHBOARD API ENDPOINTS
-// ================================
-
 app.use(
     "/api/personal-user",
     personalUserRoutes
 );
+
+// ============================================================
+// PERSONAL DASHBOARD APIS
+// ============================================================
 
 app.use(
     "/api/overview",
@@ -182,107 +226,113 @@ app.use(
     exportDetailsRoutes
 );
 
-// =============================================
-// NEW PERSONAL API ENDPOINTS
-// =============================================
+// ============================================================
+// PERSONAL TRADING
+// ============================================================
 
-// Personal Loans
-app.use(
-    "/api/personal-loans",
-    personalLoansRoutes
-);
-
-// Personal Trading
 app.use(
     "/api/personal-trading",
     personalTradingRoutes
 );
 
-// Personal Transactions
-app.use(
-    "/api/personal-transactions",
-    personalTransactionsRoutes
-);
-
-// =============================================
+// ============================================================
 // HEALTH CHECK
-// =============================================
+// ============================================================
 
 app.get(
     "/api/health",
     (req, res) => {
-
         res.status(200).json({
             success: true,
             message: "Server is running",
             timestamp: new Date().toISOString()
         });
-
     }
 );
 
-// =============================================
+// Export-details health check.
+// This does NOT require authentication and is useful for checking
+// whether the export router itself is mounted correctly.
+app.get(
+    "/api/export-details-health",
+    (req, res) => {
+        res.status(200).json({
+            success: true,
+            service: "export-details",
+            status: "mounted",
+            timestamp: new Date().toISOString()
+        });
+    }
+);
+
+// ============================================================
 // 404 HANDLER
-// =============================================
+// ============================================================
 
 app.use(
     (req, res) => {
-
         res.status(404).json({
             success: false,
             message:
                 `Route not found: ${req.method} ${req.path}`
         });
-
     }
 );
 
-// =============================================
+// ============================================================
 // ERROR HANDLER
-// =============================================
+// ============================================================
 
 app.use(
     (err, req, res, next) => {
-
         console.error(
             "Server Error:",
-            err.message
+            err
         );
 
         if (
+            err &&
             err.message ===
             "Not allowed by CORS"
         ) {
-
             return res.status(403).json({
                 success: false,
                 message:
-                    "CORS origin not allowed"
+                    "CORS origin not allowed",
+                origin:
+                    cleanOrigin(req.headers.origin)
             });
-
         }
 
-        res.status(500).json({
+        if (res.headersSent) {
+            return next(err);
+        }
+
+        return res.status(500).json({
             success: false,
             message:
                 "Internal server error"
         });
-
     }
 );
 
-// =============================================
+// ============================================================
 // START SERVER
-// =============================================
+// ============================================================
 
 const PORT =
-    process.env.PORT || 5000;
+    Number(process.env.PORT) || 5000;
 
 app.listen(
     PORT,
     () => {
         console.log(
             `🚀 Server Running on port ${PORT}`
+        );
+
+        console.log(
+            "Allowed CORS origins:",
+            allowedOrigins
         );
     }
 );
