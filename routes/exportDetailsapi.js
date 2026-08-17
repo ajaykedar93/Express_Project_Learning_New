@@ -42,35 +42,219 @@ const router = express.Router();
 const db = require("../db");
 
 // -----------------------------------------------------------------------------
-// AUTH
+// AUTH - USE THE SAME LOGGED-IN USER
 // -----------------------------------------------------------------------------
-// This middleware accepts the user ID already supplied by your existing
-// login/authentication middleware.
+// This router does NOT create a second login system.
 //
-// Supported req.user shapes:
+// It accepts the authenticated user from the existing application in the
+// common forms used by Express login/JWT/session middleware:
+//
 //   req.user.id
 //   req.user.userId
 //   req.user.user_id
+//   req.session.user.id
+//   req.session.user.userId
+//   req.session.user.user_id
+//   req.authUser.id
+//   req.authUser.userId
+//   req.authUser.user_id
+//   res.locals.user.id
+//   req.userId
+//   req.authUserId
 //
-// If your existing middleware uses another property, change only this block.
+// It also accepts a Bearer JWT when JWT_SECRET is configured.
+// JWT payload fields supported:
+//   id, userId, user_id
+//
+// Finally, x-user-id is accepted only when your existing frontend/backend
+// already uses that header. Prefer the existing verified req.user/session path.
+//
+// IMPORTANT:
+// Do not change the login page. Mount this router AFTER your existing auth
+// middleware if that middleware populates req.user.
+//
+// Example:
+//
+//   app.use(authenticateToken);
+//   app.use("/api/export-details", require("./routes/exportDetailsapi"));
+//
+// If your login middleware already runs globally, req.user will be used.
+
+function toValidUserId(value) {
+  if (
+    value === undefined ||
+    value === null ||
+    value === ""
+  ) {
+    return null;
+  }
+
+  const numeric = Number(value);
+
+  if (
+    !Number.isInteger(numeric) ||
+    numeric <= 0
+  ) {
+    return null;
+  }
+
+  return numeric;
+}
+
+function readUserIdFromObject(value) {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+
+  return (
+    toValidUserId(value.id) ||
+    toValidUserId(value.userId) ||
+    toValidUserId(value.user_id) ||
+    null
+  );
+}
+
+function getUserIdFromExistingAuth(req, res) {
+  const candidates = [
+    // Existing authentication middleware
+    req.user,
+    req.authUser,
+
+    // Express session
+    req.session && req.session.user,
+
+    // Some applications store the authenticated user in session.userId
+    req.session && req.session.userId,
+    req.session && req.session.user_id,
+
+    // Express locals
+    res.locals && res.locals.user,
+    res.locals && res.locals.userId,
+    res.locals && res.locals.user_id,
+
+    // Existing middleware may attach these directly
+    req.userId,
+    req.user_id,
+    req.authUserId,
+    req.auth_user_id,
+  ];
+
+  for (const candidate of candidates) {
+    const objectId = readUserIdFromObject(candidate);
+
+    if (objectId) {
+      return objectId;
+    }
+
+    const directId = toValidUserId(candidate);
+
+    if (directId) {
+      return directId;
+    }
+  }
+
+  return null;
+}
+
+function getUserIdFromBearerToken(req) {
+  const header =
+    req.headers && req.headers.authorization;
+
+  if (!header) {
+    return null;
+  }
+
+  const match =
+    /^Bearer\\s+(.+)$/i.exec(String(header).trim());
+
+  if (!match) {
+    return null;
+  }
+
+  const token = match[1].trim();
+
+  // Some simple login implementations send the numeric user ID as the
+  // bearer value. Support that without changing the login page.
+  const numericTokenId = toValidUserId(token);
+
+  if (numericTokenId) {
+    return numericTokenId;
+  }
+
+  // JWT verification is used only when JWT_SECRET exists.
+  // Never trust an unsigned JWT in production.
+  if (!process.env.JWT_SECRET) {
+    return null;
+  }
+
+  try {
+    // jsonwebtoken is intentionally required only when JWT_SECRET is set.
+    // Install it if your existing login uses JWT:
+    // npm install jsonwebtoken
+    const jwt = require("jsonwebtoken");
+
+    const decoded = jwt.verify(
+      token,
+      process.env.JWT_SECRET
+    );
+
+    return readUserIdFromObject(decoded);
+  } catch (error) {
+    console.error(
+      "Export JWT verification failed:",
+      error.message
+    );
+
+    return null;
+  }
+}
+
+function getUserIdFromHeaders(req) {
+  const headers = req.headers || {};
+
+  const candidates = [
+    headers["x-user-id"],
+    headers["x-auth-user-id"],
+    headers["x-userid"],
+  ];
+
+  for (const value of candidates) {
+    const id = toValidUserId(value);
+
+    if (id) {
+      return id;
+    }
+  }
+
+  return null;
+}
+
 function requireUser(req, res, next) {
-  const user = req.user || {};
+  // 1. First priority: EXACT authenticated user from existing login middleware.
+  let userId = getUserIdFromExistingAuth(req, res);
 
-  const userId =
-    user.id ??
-    user.userId ??
-    user.user_id ??
-    req.userId ??
-    req.authUserId;
+  // 2. Second priority: existing Bearer authentication.
+  if (!userId) {
+    userId = getUserIdFromBearerToken(req);
+  }
 
-  if (!userId || !Number.isInteger(Number(userId))) {
+  // 3. Compatibility with projects that already send x-user-id.
+  if (!userId) {
+    userId = getUserIdFromHeaders(req);
+  }
+
+  if (!userId) {
     return res.status(401).json({
       success: false,
-      message: "User authentication required.",
+      message:
+        "User authentication required. Existing login user was not attached to this request.",
+      code: "AUTH_USER_NOT_FOUND",
     });
   }
 
-  req.exportUserId = Number(userId);
+  // This is the ONLY user ID used by every query in this router.
+  req.exportUserId = userId;
+
   next();
 }
 
@@ -306,6 +490,19 @@ function addTotal(rows, field) {
 function normalizeRows(rows) {
   return Array.isArray(rows) ? rows : [];
 }
+
+// -----------------------------------------------------------------------------
+// AUTH CHECK
+// -----------------------------------------------------------------------------
+// Useful for testing the existing login without changing the login page.
+// GET /api/export-details/auth-check
+router.get("/auth-check", requireUser, (req, res) => {
+  return res.json({
+    success: true,
+    authenticated: true,
+    userId: req.exportUserId,
+  });
+});
 
 // -----------------------------------------------------------------------------
 // DATA LOADING
