@@ -8,10 +8,8 @@ const db = require("./db");
 // API ROUTE IMPORTS
 // ============================================================
 
-// Authentication
 const authRoutes = require("./routes/auth");
 
-// Personal Dashboard APIs
 const personalUserRoutes = require("./routes/personal_user");
 const overviewRoutes = require("./routes/overviewapi");
 const expenseRoutes = require("./routes/expenseapi");
@@ -21,28 +19,19 @@ const performanceRoutes = require("./routes/performanceapi");
 const summaryRoutes = require("./routes/summaryapi");
 const exportDetailsRoutes = require("./routes/exportDetailsapi");
 
-// Personal Trading
 const personalTradingRoutes = require("./routes/personal_trading");
 
 const app = express();
 
 // ============================================================
-// BASIC APP SETTINGS
-// ============================================================
-
-app.disable("x-powered-by");
-
-// ============================================================
 // CORS
 // ============================================================
 
-const defaultAllowedOrigins = [
+const allowedOrigins = [
     "http://localhost:5173",
     "http://localhost:3000",
     "https://react-learning-project-lime.vercel.app"
 ];
-
-const allowedOrigins = [...defaultAllowedOrigins];
 
 if (process.env.CLIENT_URL) {
     const clientUrl = process.env.CLIENT_URL
@@ -57,31 +46,25 @@ if (process.env.CLIENT_URL) {
     }
 }
 
-const cleanOrigin = (origin) => {
-    if (!origin) return "";
-
-    return String(origin)
-        .trim()
-        .replace(/\/$/, "");
-};
-
 const corsOptions = {
     origin: function (origin, callback) {
-        // Requests without an Origin header:
-        // Postman, curl, server-to-server, health checks, etc.
+        // Allow requests without Origin header
+        // such as Postman, curl and server-to-server requests.
         if (!origin) {
             return callback(null, true);
         }
 
-        const originValue = cleanOrigin(origin);
+        const cleanOrigin = origin
+            .trim()
+            .replace(/\/$/, "");
 
-        if (allowedOrigins.includes(originValue)) {
+        if (allowedOrigins.includes(cleanOrigin)) {
             return callback(null, true);
         }
 
         console.log(
             "CORS blocked:",
-            originValue
+            cleanOrigin
         );
 
         return callback(
@@ -121,13 +104,12 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Explicit OPTIONS handling.
-// This is important for browser preflight requests when the frontend
-// sends Authorization / X-User-Id headers.
-app.options(
-    "*",
-    cors(corsOptions)
-);
+// IMPORTANT:
+// Do NOT use app.options("*", ...).
+// Express 5 / path-to-regexp rejects "*" and throws:
+// PathError: Missing parameter name at index 1: *
+// The cors middleware above already handles OPTIONS requests.
+
 
 // ============================================================
 // BODY MIDDLEWARE
@@ -146,50 +128,28 @@ app.use(
     })
 );
 
-// ============================================================
-// REQUEST LOGGING
-// ============================================================
-
-app.use((req, res, next) => {
-    const startedAt = Date.now();
-
-    res.on("finish", () => {
-        const duration = Date.now() - startedAt;
-
-        console.log(
-            `${req.method} ${req.originalUrl} -> ${res.statusCode} (${duration}ms)`
-        );
-    });
-
-    next();
-});
 
 // ============================================================
-// AUTHENTICATION
+// ROUTES
 // ============================================================
 
+// Authentication
 app.use(
     "/api/auth",
     authRoutes
 );
 
-// ============================================================
-// PERSONAL USERS
-// ============================================================
-
+// Personal Users
 app.use(
     "/api/personal-users",
     personalUserRoutes
 );
 
+// Personal Dashboard
 app.use(
     "/api/personal-user",
     personalUserRoutes
 );
-
-// ============================================================
-// PERSONAL DASHBOARD APIS
-// ============================================================
 
 app.use(
     "/api/overview",
@@ -226,14 +186,12 @@ app.use(
     exportDetailsRoutes
 );
 
-// ============================================================
-// PERSONAL TRADING
-// ============================================================
-
+// Personal Trading
 app.use(
     "/api/personal-trading",
     personalTradingRoutes
 );
+
 
 // ============================================================
 // HEALTH CHECK
@@ -250,9 +208,11 @@ app.get(
     }
 );
 
-// Export-details health check.
-// This does NOT require authentication and is useful for checking
-// whether the export router itself is mounted correctly.
+
+// ============================================================
+// EXPORT DETAILS HEALTH CHECK
+// ============================================================
+
 app.get(
     "/api/export-details-health",
     (req, res) => {
@@ -264,6 +224,7 @@ app.get(
         });
     }
 );
+
 
 // ============================================================
 // 404 HANDLER
@@ -278,6 +239,7 @@ app.use(
         });
     }
 );
+
 
 // ============================================================
 // ERROR HANDLER
@@ -300,7 +262,7 @@ app.use(
                 message:
                     "CORS origin not allowed",
                 origin:
-                    cleanOrigin(req.headers.origin)
+                    req.headers.origin || null
             });
         }
 
@@ -315,6 +277,7 @@ app.use(
         });
     }
 );
+
 
 // ============================================================
 // START SERVER
