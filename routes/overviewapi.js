@@ -230,11 +230,11 @@ createTables();
 // GET /api/overview?month=2026-08
 //
 // This returns:
-// - Business count
-// - Work count
-// - Business payment
-// - Work payment
-// - Monthly expenses
+// - Manual total business
+// - Manual total work
+// - Manual business payment
+// - Manual work payment
+// - Automatically calculated monthly expenses
 // - Borrow
 // - Loan EMI
 // - Savings
@@ -258,42 +258,30 @@ router.get("/", authenticate, async (req, res) => {
 
     const { monthStart, nextMonthStart } = range;
 
-    // Business/work count and income for selected month.
-    const businessWorkResult = await db.query(
+    // ============================================================
+    // MANUAL MONTHLY VALUES
+    // Only these 4 overview values are entered by the user manually:
+    // - Total Business
+    // - Total Work
+    // - Business Payment
+    // - Work Payment
+    //
+    // All other overview values below are calculated automatically
+    // from their respective financial tables.
+    // ============================================================
+    const manualOverviewResult = await db.query(
       `
       SELECT
-        COUNT(*) FILTER (
-          WHERE type = 'Business'
-        )::INTEGER AS total_business,
-
-        COUNT(*) FILTER (
-          WHERE type = 'Work'
-        )::INTEGER AS total_works,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE type = 'Business'
-          ),
-          0
-        ) AS business_payment,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE type = 'Work'
-          ),
-          0
-        ) AS work_payment
-
-      FROM personal_business_work
+        total_business,
+        total_works,
+        business_payment,
+        work_payment
+      FROM personal_overview
       WHERE user_id = $1
-        AND start_date < $2::DATE
-        AND (
-          end_date IS NULL
-          OR end_date >= $3::DATE
-        )
-        AND status <> 'Paused'
+        AND month_start = $2::DATE
+      LIMIT 1
       `,
-      [req.userId, nextMonthStart, monthStart]
+      [req.userId, monthStart]
     );
 
     // Monthly expenses.
@@ -418,14 +406,22 @@ router.get("/", authenticate, async (req, res) => {
       [req.userId]
     );
 
-    const businessWork = businessWorkResult.rows[0];
+    const manualOverview = manualOverviewResult.rows[0] || {
+      total_business: 0,
+      total_works: 0,
+      business_payment: 0,
+      work_payment: 0,
+    };
+
     const expenses = expenseResult.rows[0];
     const repayments = repaymentResult.rows[0];
     const payments = paymentResult.rows[0];
     const upcoming = upcomingResult.rows[0];
 
-    const businessPayment = Number(businessWork.business_payment || 0);
-    const workPayment = Number(businessWork.work_payment || 0);
+    const totalBusiness = Number(manualOverview.total_business || 0);
+    const totalWorks = Number(manualOverview.total_works || 0);
+    const businessPayment = Number(manualOverview.business_payment || 0);
+    const workPayment = Number(manualOverview.work_payment || 0);
 
     const receivedPayments = Number(payments.total_received || 0);
 
@@ -472,12 +468,12 @@ router.get("/", authenticate, async (req, res) => {
         month,
 
         business: {
-          total: Number(businessWork.total_business || 0),
+          total: totalBusiness,
           payment: businessPayment,
         },
 
         work: {
-          total: Number(businessWork.total_works || 0),
+          total: totalWorks,
           payment: workPayment,
         },
 
@@ -543,6 +539,8 @@ router.get("/", authenticate, async (req, res) => {
 
 // ============================================================
 // 2. CREATE BUSINESS / WORK
+// These records remain available for separate Business/Work management.
+// They do NOT override the 4 manual monthly overview values above.
 // POST /api/overview/business-work
 // ============================================================
 

@@ -21,7 +21,7 @@ const loanBorrowRoutes = require("./routes/loanBorrowapi");
 const paymentRoutes = require("./routes/paymentapi");
 const performanceRoutes = require("./routes/performanceapi");
 const summaryRoutes = require("./routes/summaryapi");
-const exportDetailsRoutes = require("./routes/expenseapi");
+const exportDetailsRoutes = require("./routes/exportDetailsapi");
 
 // =============================================
 // NEW PERSONAL APIs

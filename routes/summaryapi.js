@@ -1,9 +1,17 @@
 // routes/summaryApi.js
-// Summary API
-// Selected-month complete financial summary
-// Income + expenses + EMI/loan + borrow repayment
-// Net profit/loss + savings + professional pie-chart data
-// PostgreSQL + Express + JWT
+// Complete Summary API
+// Uses:
+// personal_users
+// personal_business_work
+// personal_expenses
+// personal_loans_borrow
+// personal_loan_emi_payments
+// personal_payments
+//
+// Endpoints:
+// GET /api/summary?month=YYYY-MM
+// GET /api/summary/expense-categories?month=YYYY-MM
+// GET /api/summary/compare?month=YYYY-MM
 
 const express = require("express");
 const jwt = require("jsonwebtoken");
@@ -14,12 +22,12 @@ const db = require("../db.js");
 const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
 
 // ============================================================
-// AUTHENTICATION
+// AUTH
 // ============================================================
 
 const authenticate = (req, res, next) => {
   try {
-    const header = req.headers.authorization || "";
+    const header = String(req.headers.authorization || "");
 
     if (!header.startsWith("Bearer ")) {
       return res.status(401).json({
@@ -28,17 +36,26 @@ const authenticate = (req, res, next) => {
       });
     }
 
-    const token = header.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const token = header.slice(7).trim();
 
-    if (!decoded?.id) {
+    if (!token) {
+      return res.status(401).json({
+        success: false,
+        message: "Authentication token required",
+      });
+    }
+
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const userId = Number(decoded?.id);
+
+    if (!Number.isInteger(userId) || userId <= 0) {
       return res.status(401).json({
         success: false,
         message: "Invalid authentication token",
       });
     }
 
-    req.userId = Number(decoded.id);
+    req.userId = userId;
     next();
   } catch (error) {
     return res.status(401).json({
@@ -61,15 +78,13 @@ const getCurrentMonth = () => {
 };
 
 const getMonthRange = (month) => {
-  if (!/^\d{4}-\d{2}$/.test(month || "")) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(String(month || ""))) {
     return null;
   }
 
-  const [year, monthNumber] = month.split("-").map(Number);
-
-  if (monthNumber < 1 || monthNumber > 12) {
-    return null;
-  }
+  const [year, monthNumber] = String(month)
+    .split("-")
+    .map(Number);
 
   const monthStart =
     `${year}-${String(monthNumber).padStart(2, "0")}-01`;
@@ -89,7 +104,10 @@ const getMonthRange = (month) => {
   };
 };
 
-const toNumber = (value) => Number(value || 0);
+const toNumber = (value) => {
+  const number = Number(value);
+  return Number.isFinite(number) ? number : 0;
+};
 
 const getStatus = (income, outgoing) => {
   const net = income - outgoing;
@@ -104,26 +122,30 @@ const getStatus = (income, outgoing) => {
   return "Break Even";
 };
 
+const getPreviousMonth = (month) => {
+  const [year, monthNumber] = month.split("-").map(Number);
+
+  const date = new Date(
+    Date.UTC(year, monthNumber - 2, 1)
+  );
+
+  return `${date.getUTCFullYear()}-${String(
+    date.getUTCMonth() + 1
+  ).padStart(2, "0")}`;
+};
+
+const safeCount = (value) => Number(value || 0);
+
 // ============================================================
-// MAIN SUMMARY
+// 1. MAIN SUMMARY
 // GET /api/summary?month=2026-08
-//
-// User logic:
-// 1. Total income = all received payments.
-// 2. Total expense = selected month's expenses.
-// 3. EMI / loan repayment = selected month's actual repayments.
-// 4. Borrow repayment = selected month's actual borrow repayments.
-// 5. Net = income - all outgoing.
-// 6. Savings = positive net amount.
-// 7. Profit / Loss status.
-// 8. Pending / overdue / lost payments.
-// 9. Pie chart data.
 // ============================================================
 
 router.get("/", authenticate, async (req, res) => {
   try {
-    const month =
-      req.query.month || getCurrentMonth();
+    const month = String(
+      req.query.month || getCurrentMonth()
+    );
 
     const range = getMonthRange(month);
 
@@ -134,19 +156,24 @@ router.get("/", authenticate, async (req, res) => {
       });
     }
 
-    // ========================================================
-    // Run all independent queries together.
-    // ========================================================
+    // IMPORTANT:
+    // Every db.query() below uses exactly:
+    // db.query(sql, values)
+    //
+    // No callback argument is passed.
+    // This prevents the pg-pool:
+    // "TypeError: cb is not a function" error.
 
     const [
       paymentResult,
       expenseResult,
       repaymentResult,
       loanBorrowResult,
+      businessWorkResult,
     ] = await Promise.all([
-      // ------------------------------------------------------
-      // Payments
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // PAYMENTS
+      // --------------------------------------------------------
 
       db.query(
         `
@@ -210,16 +237,19 @@ router.get("/", authenticate, async (req, res) => {
         ]
       ),
 
-      // ------------------------------------------------------
-      // Expenses
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // EXPENSES
+      // --------------------------------------------------------
 
       db.query(
         `
         SELECT
           COALESCE(SUM(amount), 0) AS total_expense,
-          COUNT(*)::INTEGER AS expense_count
+          COUNT(*)::INTEGER AS expense_count,
+          COUNT(DISTINCT category)::INTEGER AS category_count
+
         FROM personal_expenses
+
         WHERE user_id = $1
           AND expense_date >= $2::DATE
           AND expense_date < $3::DATE
@@ -231,9 +261,9 @@ router.get("/", authenticate, async (req, res) => {
         ]
       ),
 
-      // ------------------------------------------------------
-      // Loan / Borrow repayments
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // EMI / LOAN / BORROW REPAYMENTS
+      // --------------------------------------------------------
 
       db.query(
         `
@@ -276,9 +306,9 @@ router.get("/", authenticate, async (req, res) => {
         ]
       ),
 
-      // ------------------------------------------------------
-      // Current outstanding Loan / Borrow information
-      // ------------------------------------------------------
+      // --------------------------------------------------------
+      // LOAN / BORROW OUTSTANDING
+      // --------------------------------------------------------
 
       db.query(
         `
@@ -325,49 +355,95 @@ router.get("/", authenticate, async (req, res) => {
         `,
         [req.userId]
       ),
+
+      // --------------------------------------------------------
+      // BUSINESS / WORK
+      //
+      // Uses records active during the selected month.
+      // Amount totals are grouped by type.
+      // --------------------------------------------------------
+
+      db.query(
+        `
+        SELECT
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE type = 'Business'
+            ),
+            0
+          ) AS business_total,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE type = 'Work'
+            ),
+            0
+          ) AS work_total,
+
+          COUNT(*) FILTER (
+            WHERE type = 'Business'
+          )::INTEGER AS business_count,
+
+          COUNT(*) FILTER (
+            WHERE type = 'Work'
+          )::INTEGER AS work_count,
+
+          COUNT(*) FILTER (
+            WHERE status = 'Active'
+          )::INTEGER AS active_count,
+
+          COUNT(*) FILTER (
+            WHERE status = 'Completed'
+          )::INTEGER AS completed_count,
+
+          COUNT(*) FILTER (
+            WHERE status = 'Paused'
+          )::INTEGER AS paused_count
+
+        FROM personal_business_work
+
+        WHERE user_id = $1
+          AND start_date < $2::DATE
+          AND (
+            end_date IS NULL
+            OR end_date >= $3::DATE
+          )
+        `,
+        [
+          req.userId,
+          range.nextMonthStart,
+          range.monthStart,
+        ]
+      ),
     ]);
 
-    const payment = paymentResult.rows[0];
-    const expense = expenseResult.rows[0];
-    const repayment = repaymentResult.rows[0];
-    const loanBorrow = loanBorrowResult.rows[0];
+    const payment = paymentResult.rows[0] || {};
+    const expense = expenseResult.rows[0] || {};
+    const repayment = repaymentResult.rows[0] || {};
+    const loanBorrow = loanBorrowResult.rows[0] || {};
+    const businessWork = businessWorkResult.rows[0] || {};
 
     // ========================================================
-    // Income
+    // CALCULATIONS
     // ========================================================
 
-    const totalIncome =
-      toNumber(payment.received);
+    const totalIncome = toNumber(payment.received);
 
-    // ========================================================
-    // Expenses
-    // ========================================================
+    const totalExpense = toNumber(
+      expense.total_expense
+    );
 
-    const totalExpense =
-      toNumber(expense.total_expense);
+    const emiPaid = toNumber(
+      repayment.emi_paid
+    );
 
-    // ========================================================
-    // Loan / EMI
-    // ========================================================
+    const loanRepayment = toNumber(
+      repayment.loan_repayment
+    );
 
-    const emiPaid =
-      toNumber(repayment.emi_paid);
-
-    const loanRepayment =
-      toNumber(repayment.loan_repayment);
-
-    // ========================================================
-    // Borrow repayment
-    // ========================================================
-
-    const borrowRepayment =
-      toNumber(repayment.borrow_repayment);
-
-    // ========================================================
-    // Total outgoing
-    //
-    // Expense + EMI + Loan Repayment + Borrow Repayment
-    // ========================================================
+    const borrowRepayment = toNumber(
+      repayment.borrow_repayment
+    );
 
     const totalLoanOutgoing =
       emiPaid + loanRepayment;
@@ -376,10 +452,6 @@ router.get("/", authenticate, async (req, res) => {
       totalExpense +
       totalLoanOutgoing +
       borrowRepayment;
-
-    // ========================================================
-    // Net result
-    // ========================================================
 
     const netAmount =
       totalIncome - totalOutgoing;
@@ -396,8 +468,14 @@ router.get("/", authenticate, async (req, res) => {
         totalOutgoing
       );
 
+    const businessTotal =
+      toNumber(businessWork.business_total);
+
+    const workTotal =
+      toNumber(businessWork.work_total);
+
     // ========================================================
-    // Pie chart
+    // MAIN PIE CHART
     // ========================================================
 
     const pieChart = [
@@ -410,17 +488,29 @@ router.get("/", authenticate, async (req, res) => {
         value: totalExpense,
       },
       {
-        label: "EMI / Loan",
-        value: totalLoanOutgoing,
+        label: "EMI",
+        value: emiPaid,
+      },
+      {
+        label: "Loan Repayment",
+        value: loanRepayment,
       },
       {
         label: "Borrow Repayment",
         value: borrowRepayment,
       },
-    ];
+      {
+        label: "Business",
+        value: businessTotal,
+      },
+      {
+        label: "Work",
+        value: workTotal,
+      },
+    ].filter((item) => item.value > 0);
 
     // ========================================================
-    // Payment status chart
+    // PAYMENT STATUS CHART
     // ========================================================
 
     const paymentStatusChart = [
@@ -440,36 +530,45 @@ router.get("/", authenticate, async (req, res) => {
         label: "Lost",
         value: toNumber(payment.lost),
       },
-    ];
-
-    // ========================================================
-    // Final response
-    // ========================================================
+    ].filter((item) => item.value > 0);
 
     return res.json({
       success: true,
-
       month,
 
+      totals: {
+        total_income: totalIncome,
+        total_expense: totalExpense,
+        total_emi: emiPaid,
+        total_loan_repayment: loanRepayment,
+        total_borrow_repayment: borrowRepayment,
+        total_outgoing: totalOutgoing,
+        net: netAmount,
+        savings,
+        loss,
+        status,
+      },
+
       income: {
-        total: totalIncome,
-        received_count: Number(
-          payment.received_count || 0
+        received: totalIncome,
+        received_count: safeCount(
+          payment.received_count
         ),
       },
 
       expenses: {
         total: totalExpense,
-        count: Number(
-          expense.expense_count || 0
+        count: safeCount(
+          expense.expense_count
+        ),
+        categories: safeCount(
+          expense.category_count
         ),
       },
 
       loan: {
-        emi_paid: emiPaid,
-
-        loan_repayment: loanRepayment,
-
+        emi: emiPaid,
+        repayment: loanRepayment,
         total_loan_outgoing:
           totalLoanOutgoing,
       },
@@ -478,93 +577,122 @@ router.get("/", authenticate, async (req, res) => {
         repayment: borrowRepayment,
       },
 
+      business_work: {
+        business_total: businessTotal,
+        work_total: workTotal,
+
+        business_count:
+          safeCount(
+            businessWork.business_count
+          ),
+
+        work_count:
+          safeCount(
+            businessWork.work_count
+          ),
+
+        active_count:
+          safeCount(
+            businessWork.active_count
+          ),
+
+        completed_count:
+          safeCount(
+            businessWork.completed_count
+          ),
+
+        paused_count:
+          safeCount(
+            businessWork.paused_count
+          ),
+      },
+
       payments: {
-        received: toNumber(payment.received),
-        pending: toNumber(payment.pending),
-        overdue: toNumber(payment.overdue),
-        lost: toNumber(payment.lost),
-
-        received_count: Number(
-          payment.received_count || 0
+        received: toNumber(
+          payment.received
         ),
 
-        pending_count: Number(
-          payment.pending_count || 0
+        pending: toNumber(
+          payment.pending
         ),
 
-        overdue_count: Number(
-          payment.overdue_count || 0
+        overdue: toNumber(
+          payment.overdue
         ),
 
-        lost_count: Number(
-          payment.lost_count || 0
+        lost: toNumber(
+          payment.lost
         ),
 
-        total_count: Number(
-          payment.total_count || 0
-        ),
+        received_count:
+          safeCount(
+            payment.received_count
+          ),
+
+        pending_count:
+          safeCount(
+            payment.pending_count
+          ),
+
+        overdue_count:
+          safeCount(
+            payment.overdue_count
+          ),
+
+        lost_count:
+          safeCount(
+            payment.lost_count
+          ),
+
+        total_count:
+          safeCount(
+            payment.total_count
+          ),
       },
 
       outstanding: {
-        active_loan_total: toNumber(
-          loanBorrow.active_loan_total
-        ),
+        active_loan_total:
+          toNumber(
+            loanBorrow.active_loan_total
+          ),
 
-        active_borrow_total: toNumber(
-          loanBorrow.active_borrow_total
-        ),
+        active_borrow_total:
+          toNumber(
+            loanBorrow.active_borrow_total
+          ),
 
-        active_loan_count: Number(
-          loanBorrow.active_loan_count || 0
-        ),
+        active_loan_count:
+          safeCount(
+            loanBorrow.active_loan_count
+          ),
 
-        active_borrow_count: Number(
-          loanBorrow.active_borrow_count || 0
-        ),
+        active_borrow_count:
+          safeCount(
+            loanBorrow.active_borrow_count
+          ),
 
-        overdue_loan_count: Number(
-          loanBorrow.overdue_loan_count || 0
-        ),
+        overdue_loan_count:
+          safeCount(
+            loanBorrow.overdue_loan_count
+          ),
 
-        overdue_borrow_count: Number(
-          loanBorrow.overdue_borrow_count || 0
-        ),
-      },
-
-      totals: {
-        total_income: totalIncome,
-
-        total_expense: totalExpense,
-
-        total_emi:
-          emiPaid,
-
-        total_loan_repayment:
-          loanRepayment,
-
-        total_borrow_repayment:
-          borrowRepayment,
-
-        total_outgoing:
-          totalOutgoing,
-
-        net:
-          netAmount,
-
-        savings,
-
-        loss,
-
-        status,
+        overdue_borrow_count:
+          safeCount(
+            loanBorrow.overdue_borrow_count
+          ),
       },
 
       chart: {
         pie: pieChart,
-        payment_status: paymentStatusChart,
+        payment_status:
+          paymentStatusChart,
       },
     });
   } catch (error) {
-    console.error("❌ Summary API error:", error);
+    console.error(
+      "❌ Summary API error:",
+      error
+    );
 
     return res.status(500).json({
       success: false,
@@ -575,10 +703,8 @@ router.get("/", authenticate, async (req, res) => {
 });
 
 // ============================================================
-// 2. CATEGORY EXPENSE SUMMARY
+// 2. EXPENSE CATEGORY SUMMARY
 // GET /api/summary/expense-categories?month=2026-08
-//
-// Useful for the Summary page category pie chart.
 // ============================================================
 
 router.get(
@@ -586,8 +712,9 @@ router.get(
   authenticate,
   async (req, res) => {
     try {
-      const month =
-        req.query.month || getCurrentMonth();
+      const month = String(
+        req.query.month || getCurrentMonth()
+      );
 
       const range = getMonthRange(month);
 
@@ -604,11 +731,15 @@ router.get(
           category,
           COALESCE(SUM(amount), 0) AS total,
           COUNT(*)::INTEGER AS count
+
         FROM personal_expenses
+
         WHERE user_id = $1
           AND expense_date >= $2::DATE
           AND expense_date < $3::DATE
+
         GROUP BY category
+
         ORDER BY total DESC, category ASC
         `,
         [
@@ -625,7 +756,7 @@ router.get(
         data: result.rows.map((row) => ({
           category: row.category,
           total: toNumber(row.total),
-          count: Number(row.count || 0),
+          count: safeCount(row.count),
         })),
       });
     } catch (error) {
@@ -647,8 +778,6 @@ router.get(
 // ============================================================
 // 3. MONTH COMPARISON
 // GET /api/summary/compare?month=2026-08
-//
-// Compares selected month with previous month.
 // ============================================================
 
 router.get(
@@ -656,8 +785,9 @@ router.get(
   authenticate,
   async (req, res) => {
     try {
-      const month =
-        req.query.month || getCurrentMonth();
+      const month = String(
+        req.query.month || getCurrentMonth()
+      );
 
       const range = getMonthRange(month);
 
@@ -668,42 +798,37 @@ router.get(
         });
       }
 
-      const [year, monthNumber] =
-        month.split("-").map(Number);
-
-      const previousDate = new Date(
-        Date.UTC(
-          year,
-          monthNumber - 2,
-          1
-        )
-      );
-
       const previousMonth =
-        `${previousDate.getUTCFullYear()}-${String(
-          previousDate.getUTCMonth() + 1
-        ).padStart(2, "0")}`;
+        getPreviousMonth(month);
 
       const previousRange =
         getMonthRange(previousMonth);
+
+      // ------------------------------------------------------
+      // Helper for one month's comparison totals.
+      // ------------------------------------------------------
 
       const getMonthTotals = async (
         monthRange
       ) => {
         const [
-          payment,
-          expense,
-          repayment,
+          paymentResult,
+          expenseResult,
+          repaymentResult,
+          businessWorkResult,
         ] = await Promise.all([
           db.query(
             `
-            SELECT COALESCE(
-              SUM(amount) FILTER (
-                WHERE status = 'Received'
-              ),
-              0
-            ) AS income
+            SELECT
+              COALESCE(
+                SUM(amount) FILTER (
+                  WHERE status = 'Received'
+                ),
+                0
+              ) AS income
+
             FROM personal_payments
+
             WHERE user_id = $1
               AND payment_date >= $2::DATE
               AND payment_date < $3::DATE
@@ -717,8 +842,11 @@ router.get(
 
           db.query(
             `
-            SELECT COALESCE(SUM(amount),0) AS expense
+            SELECT
+              COALESCE(SUM(amount), 0) AS expense
+
             FROM personal_expenses
+
             WHERE user_id = $1
               AND expense_date >= $2::DATE
               AND expense_date < $3::DATE
@@ -732,8 +860,11 @@ router.get(
 
           db.query(
             `
-            SELECT COALESCE(SUM(amount),0) AS repayment
+            SELECT
+              COALESCE(SUM(amount), 0) AS repayment
+
             FROM personal_loan_emi_payments
+
             WHERE user_id = $1
               AND payment_date >= $2::DATE
               AND payment_date < $3::DATE
@@ -744,35 +875,87 @@ router.get(
               monthRange.nextMonthStart,
             ]
           ),
+
+          db.query(
+            `
+            SELECT
+              COALESCE(
+                SUM(amount) FILTER (
+                  WHERE type = 'Business'
+                ),
+                0
+              ) AS business,
+
+              COALESCE(
+                SUM(amount) FILTER (
+                  WHERE type = 'Work'
+                ),
+                0
+              ) AS work
+
+            FROM personal_business_work
+
+            WHERE user_id = $1
+              AND start_date < $2::DATE
+              AND (
+                end_date IS NULL
+                OR end_date >= $3::DATE
+              )
+            `,
+            [
+              req.userId,
+              monthRange.nextMonthStart,
+              monthRange.monthStart,
+            ]
+          ),
         ]);
 
         const income =
-          toNumber(payment.rows[0].income);
+          toNumber(
+            paymentResult.rows[0]?.income
+          );
 
-        const expenseTotal =
-          toNumber(expense.rows[0].expense);
+        const expense =
+          toNumber(
+            expenseResult.rows[0]?.expense
+          );
 
-        const repaymentTotal =
-          toNumber(repayment.rows[0].repayment);
+        const repayment =
+          toNumber(
+            repaymentResult.rows[0]?.repayment
+          );
+
+        const business =
+          toNumber(
+            businessWorkResult.rows[0]?.business
+          );
+
+        const work =
+          toNumber(
+            businessWorkResult.rows[0]?.work
+          );
 
         const outgoing =
-          expenseTotal +
-          repaymentTotal;
+          expense + repayment;
 
         return {
           income,
-          expense: expenseTotal,
-          repayment: repaymentTotal,
+          expense,
+          repayment,
+          business,
+          work,
           outgoing,
           net: income - outgoing,
         };
       };
 
-      const [current, previous] =
-        await Promise.all([
-          getMonthTotals(range),
-          getMonthTotals(previousRange),
-        ]);
+      const [
+        current,
+        previous,
+      ] = await Promise.all([
+        getMonthTotals(range),
+        getMonthTotals(previousRange),
+      ]);
 
       const percentageChange = (
         currentValue,
@@ -820,6 +1003,16 @@ router.get(
           repayment: percentageChange(
             current.repayment,
             previous.repayment
+          ),
+
+          business: percentageChange(
+            current.business,
+            previous.business
+          ),
+
+          work: percentageChange(
+            current.work,
+            previous.work
           ),
 
           net: percentageChange(

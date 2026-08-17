@@ -1,321 +1,234 @@
-// routes/expenseApi.js
-// Expense API - complete CRUD + weekly/monthly/category calculations
-// PostgreSQL + Express + JWT
-
 const express = require("express");
 const jwt = require("jsonwebtoken");
-
 const router = express.Router();
-const db = require("../db.js");
+const db = require("../db");
 
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
+const DEFAULT_CATEGORIES = [
+  "Petrol",
+  "Daily Kharch Saman",
+  "Shopping",
+  "Food",
+  "Travel",
+  "Bike",
+  "Business",
+];
 
-// ============================================================
-// AUTH
-// ============================================================
+const getJwtSecret = () =>
+  process.env.JWT_SECRET ||
+  process.env.JWT_SECRET_KEY ||
+  process.env.ACCESS_TOKEN_SECRET ||
+  process.env.AUTH_SECRET;
 
-const authenticate = (req, res, next) => {
+const getUserId = (req) => {
+  // Supports existing auth middleware first.
+  const existingId =
+    req.userId ??
+    req.user?.id ??
+    req.user?.userId ??
+    req.auth?.id ??
+    req.auth?.userId;
+
+  if (existingId !== undefined && existingId !== null) {
+    const id = Number(existingId);
+    return Number.isInteger(id) && id > 0 ? id : null;
+  }
+
+  // Login stores JWT as localStorage "token".
+  // Expense.jsx must send: Authorization: Bearer <token>
+  const header = String(req.headers.authorization || "");
+
+  if (!header.startsWith("Bearer ")) return null;
+
+  const token = header.slice(7).trim();
+  const secret = getJwtSecret();
+
+  if (!token || !secret) return null;
+
   try {
-    const header = req.headers.authorization || "";
+    const decoded = jwt.verify(token, secret);
 
-    if (!header.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token required",
-      });
-    }
+    const rawId =
+      decoded?.userId ??
+      decoded?.id ??
+      decoded?.user?.id ??
+      decoded?.sub;
 
-    const token = header.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET);
+    const id = Number(rawId);
 
-    if (!decoded?.id) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authentication token",
-      });
-    }
-
-    req.userId = Number(decoded.id);
-    next();
+    return Number.isInteger(id) && id > 0 ? id : null;
   } catch (error) {
+    console.error("Expense JWT error:", error.message);
+    return null;
+  }
+};
+
+const requireUser = (req, res, next) => {
+  const userId = getUserId(req);
+
+  if (!userId) {
     return res.status(401).json({
       success: false,
-      message: "Invalid or expired authentication token",
+      message: "User authentication required.",
     });
   }
+
+  req.userId = userId;
+  next();
 };
 
-// ============================================================
-// HELPERS
-// ============================================================
+const normalizeAmount = (value) => {
+  const amount = Number(value);
 
-const getCurrentMonth = () => {
-  const now = new Date();
+  if (!Number.isFinite(amount) || amount <= 0) return null;
 
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  return Math.round((amount + Number.EPSILON) * 100) / 100;
 };
 
-const getMonthRange = (month) => {
-  if (!/^\d{4}-\d{2}$/.test(month || "")) {
-    return null;
-  }
+const validDate = (value) =>
+  /^\d{4}-\d{2}-\d{2}$/.test(String(value || ""));
 
-  const [year, monthNumber] = month.split("-").map(Number);
+const validMonth = (value) =>
+  /^\d{4}-(0[1-9]|1[0-2])$/.test(String(value || ""));
 
-  if (monthNumber < 1 || monthNumber > 12) {
-    return null;
-  }
+const currentMonth = () => {
+  const d = new Date();
 
-  const monthStart =
-    `${year}-${String(monthNumber).padStart(2, "0")}-01`;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}`;
+};
 
-  const nextYear =
-    monthNumber === 12 ? year + 1 : year;
+const today = () => {
+  const d = new Date();
 
-  const nextMonth =
-    monthNumber === 12 ? 1 : monthNumber + 1;
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(
+    2,
+    "0"
+  )}-${String(d.getDate()).padStart(2, "0")}`;
+};
 
-  const nextMonthStart =
-    `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
+const monthRange = (month) => {
+  const [year, monthNo] = month.split("-").map(Number);
 
-  const lastDay =
-    new Date(Date.UTC(year, monthNumber, 0))
-      .toISOString()
-      .slice(0, 10);
+  const start = `${year}-${String(monthNo).padStart(2, "0")}-01`;
+
+  const next =
+    monthNo === 12
+      ? `${year + 1}-01-01`
+      : `${year}-${String(monthNo + 1).padStart(2, "0")}-01`;
+
+  return { start, next };
+};
+
+const weekRange = (month, week) => {
+  const [year, monthNo] = month.split("-").map(Number);
+
+  if (!Number.isInteger(week) || week < 1 || week > 5) return null;
+
+  const startDay = (week - 1) * 7 + 1;
+  const daysInMonth = new Date(year, monthNo, 0).getDate();
+
+  if (startDay > daysInMonth) return null;
+
+  const endDay = Math.min(startDay + 6, daysInMonth);
 
   return {
-    monthStart,
-    nextMonthStart,
-    lastDay,
+    start: `${year}-${String(monthNo).padStart(2, "0")}-${String(
+      startDay
+    ).padStart(2, "0")}`,
+    end: `${year}-${String(monthNo).padStart(2, "0")}-${String(
+      endDay
+    ).padStart(2, "0")}`,
   };
 };
 
-const isValidDate = (value) => {
-  if (!value || typeof value !== "string") {
-    return false;
-  }
+const uniqueCategories = (items) =>
+  [...DEFAULT_CATEGORIES, ...items]
+    .map((x) => String(x || "").trim())
+    .filter(Boolean)
+    .filter(
+      (item, index, array) =>
+        array.findIndex(
+          (x) => x.toLowerCase() === item.toLowerCase()
+        ) === index
+    )
+    .sort((a, b) => {
+      const ai = DEFAULT_CATEGORIES.findIndex(
+        (x) => x.toLowerCase() === a.toLowerCase()
+      );
+      const bi = DEFAULT_CATEGORIES.findIndex(
+        (x) => x.toLowerCase() === b.toLowerCase()
+      );
 
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) {
-    return false;
-  }
+      if (ai !== -1 && bi !== -1) return ai - bi;
+      if (ai !== -1) return -1;
+      if (bi !== -1) return 1;
 
-  const date = new Date(`${value}T00:00:00Z`);
+      return a.localeCompare(b);
+    });
 
-  return !Number.isNaN(date.getTime());
-};
+/*
+|--------------------------------------------------------------------------
+| GET categories
+|--------------------------------------------------------------------------
+*/
 
-const isValidMonth = (month) => {
-  return Boolean(getMonthRange(month));
-};
-
-const parseAmount = (value) => {
-  const amount = Number(value);
-
-  if (!Number.isFinite(amount) || amount <= 0) {
-    return null;
-  }
-
-  return amount;
-};
-
-// ============================================================
-// WEEK CALCULATION
-//
-// Week 1 = days 1-7
-// Week 2 = days 8-14
-// Week 3 = days 15-21
-// Week 4 = days 22-28
-// Week 5 = days 29-end of month
-//
-// This keeps weekly expense reporting consistent.
-// ============================================================
-
-const getWeekNumber = (dateString) => {
-  const day = Number(dateString.slice(8, 10));
-
-  if (day <= 7) return 1;
-  if (day <= 14) return 2;
-  if (day <= 21) return 3;
-  if (day <= 28) return 4;
-
-  return 5;
-};
-
-// ============================================================
-// CREATE TABLE + INDEXES
-// ============================================================
-
-const createTable = async () => {
+router.get("/categories", requireUser, async (req, res) => {
   try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS personal_expenses (
-        id SERIAL PRIMARY KEY,
-
-        user_id INTEGER NOT NULL
-          REFERENCES personal_users(id)
-          ON DELETE CASCADE,
-
-        category VARCHAR(100) NOT NULL,
-
-        amount NUMERIC(15,2) NOT NULL,
-
-        expense_date DATE NOT NULL DEFAULT CURRENT_DATE,
-
-        notes TEXT,
-
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-        CONSTRAINT chk_expense_amount
-          CHECK (amount > 0)
-      )
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_expenses_user_date
-      ON personal_expenses(user_id, expense_date)
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_expenses_user_category
-      ON personal_expenses(user_id, category)
-    `);
-
-    console.log("✅ Personal expenses table ready");
-  } catch (error) {
-    console.error(
-      "❌ Expense table setup error:",
-      error.message
-    );
-  }
-};
-
-createTable();
-
-// ============================================================
-// 1. CREATE EXPENSE
-// POST /api/expenses
-//
-// User can select an expense date only inside the selected month.
-// Backend verifies that the date belongs to the requested month.
-// ============================================================
-
-router.post("/", authenticate, async (req, res) => {
-  try {
-    const {
-      category,
-      amount,
-      expense_date,
-      notes,
-      month,
-    } = req.body;
-
-    if (!category || !String(category).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Expense category is required",
-      });
-    }
-
-    const numericAmount = parseAmount(amount);
-
-    if (numericAmount === null) {
-      return res.status(400).json({
-        success: false,
-        message: "Amount must be greater than 0",
-      });
-    }
-
-    const selectedMonth = month || getCurrentMonth();
-    const range = getMonthRange(selectedMonth);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    const date =
-      expense_date ||
-      new Date().toISOString().slice(0, 10);
-
-    if (!isValidDate(date)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense date",
-      });
-    }
-
-    // Expense must belong to selected month.
-    if (
-      date < range.monthStart ||
-      date >= range.nextMonthStart
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Expense date must belong to the selected month",
-      });
-    }
-
     const result = await db.query(
       `
-      INSERT INTO personal_expenses (
-        user_id,
-        category,
-        amount,
-        expense_date,
-        notes
-      )
-      VALUES ($1,$2,$3,$4,$5)
-      RETURNING *
+      SELECT DISTINCT category
+      FROM personal_expenses
+      WHERE user_id = $1
+        AND TRIM(category) <> ''
+      ORDER BY category ASC
       `,
-      [
-        req.userId,
-        String(category).trim(),
-        numericAmount,
-        date,
-        notes || null,
-      ]
+      [req.userId]
     );
 
-    const created = result.rows[0];
+    const categories = uniqueCategories(
+      result.rows.map((row) => row.category)
+    );
 
-    return res.status(201).json({
+    res.json({
       success: true,
-      message: "Expense added successfully",
-      data: {
-        ...created,
-        week: getWeekNumber(created.expense_date),
-      },
+      categories,
+      defaultCategories: DEFAULT_CATEGORIES,
     });
   } catch (error) {
-    console.error("❌ Create expense error:", error);
+    console.error("GET expense categories error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to add expense",
-      error: error.message,
+      message: "Failed to load expense categories.",
     });
   }
 });
 
-// ============================================================
-// 2. GET ALL EXPENSES
-// GET /api/expenses?month=2026-08&category=Food&week=2
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET expenses
+|--------------------------------------------------------------------------
+| /api/expenses
+| /api/expenses?month=2026-08
+| /api/expenses?month=2026-08&week=1
+|--------------------------------------------------------------------------
+*/
 
-router.get("/", authenticate, async (req, res) => {
+router.get("/", requireUser, async (req, res) => {
   try {
-    const month = req.query.month || getCurrentMonth();
-    const category = req.query.category;
-    const week = req.query.week
-      ? Number(req.query.week)
-      : null;
+    const userId = req.userId;
+    const month = String(req.query.month || currentMonth());
 
-    const range = getMonthRange(month);
+    const week =
+      req.query.week === undefined ||
+      req.query.week === "" ||
+      req.query.week === "all"
+        ? null
+        : Number(req.query.week);
 
-    if (!range) {
+    if (!validMonth(month)) {
       return res.status(400).json({
         success: false,
         message: "Invalid month. Use YYYY-MM.",
@@ -328,378 +241,96 @@ router.get("/", authenticate, async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        message: "Week must be between 1 and 5",
+        message: "Week must be between 1 and 5.",
       });
     }
+
+    const { start, next } = monthRange(month);
 
     let query = `
       SELECT
         id,
+        user_id,
         category,
         amount,
         expense_date,
         notes,
-        created_at
+        created_at,
+        updated_at
       FROM personal_expenses
       WHERE user_id = $1
         AND expense_date >= $2::DATE
         AND expense_date < $3::DATE
     `;
 
-    const values = [
-      req.userId,
-      range.monthStart,
-      range.nextMonthStart,
-    ];
-
-    let index = 4;
-
-    if (category) {
-      query += ` AND LOWER(category) = LOWER($${index})`;
-      values.push(String(category).trim());
-      index++;
-    }
+    const values = [userId, start, next];
 
     if (week !== null) {
-      const weekStartDay =
-        week === 1 ? 1 :
-        week === 2 ? 8 :
-        week === 3 ? 15 :
-        week === 4 ? 22 :
-        29;
+      const range = weekRange(month, week);
 
-      const weekEndDay =
-        week === 1 ? 8 :
-        week === 2 ? 15 :
-        week === 3 ? 22 :
-        week === 4 ? 29 :
-        null;
+      if (!range) {
+        return res.json({
+          success: true,
+          month,
+          selectedWeek: week,
+          expenses: [],
+          data: [],
+          rows: [],
+          summary: {
+            monthTotal: 0,
+            monthEntries: 0,
+            selectedWeekTotal: 0,
+            selectedWeekEntries: 0,
+            categoryTotals: [],
+            weekTotals: [],
+          },
+        });
+      }
 
       query += `
-        AND EXTRACT(DAY FROM expense_date) >= ${weekStartDay}
+        AND expense_date >= $4::DATE
+        AND expense_date <= $5::DATE
       `;
 
-      if (weekEndDay) {
-        query += `
-          AND EXTRACT(DAY FROM expense_date) < ${weekEndDay}
-        `;
-      }
+      values.push(range.start, range.end);
     }
 
     query += `
-      ORDER BY expense_date DESC, id DESC
+      ORDER BY expense_date DESC, created_at DESC, id DESC
     `;
 
-    const result = await db.query(query, values);
+    const expensesResult = await db.query(query, values);
 
-    const data = result.rows.map((row) => ({
-      ...row,
-      week: getWeekNumber(row.expense_date),
-    }));
-
-    return res.json({
-      success: true,
-      month,
-      count: data.length,
-      data,
-    });
-  } catch (error) {
-    console.error("❌ Get expenses error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch expenses",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 3. GET SINGLE EXPENSE
-// GET /api/expenses/:id
-// ============================================================
-
-router.get("/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense ID",
-      });
-    }
-
-    const result = await db.query(
+    const monthResult = await db.query(
       `
       SELECT
-        id,
+        COALESCE(SUM(amount), 0) AS total,
+        COUNT(*)::INTEGER AS entries
+      FROM personal_expenses
+      WHERE user_id = $1
+        AND expense_date >= $2::DATE
+        AND expense_date < $3::DATE
+      `,
+      [userId, start, next]
+    );
+
+    const categoryResult = await db.query(
+      `
+      SELECT
         category,
-        amount,
-        expense_date,
-        notes,
-        created_at
+        COALESCE(SUM(amount), 0) AS total,
+        COUNT(*)::INTEGER AS entries
       FROM personal_expenses
-      WHERE id = $1
-        AND user_id = $2
+      WHERE user_id = $1
+        AND expense_date >= $2::DATE
+        AND expense_date < $3::DATE
+      GROUP BY category
+      ORDER BY total DESC, category ASC
       `,
-      [id, req.userId]
+      [userId, start, next]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Expense not found",
-      });
-    }
-
-    const expense = result.rows[0];
-
-    return res.json({
-      success: true,
-      data: {
-        ...expense,
-        week: getWeekNumber(expense.expense_date),
-      },
-    });
-  } catch (error) {
-    console.error("❌ Get single expense error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch expense",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 4. UPDATE EXPENSE
-// PUT /api/expenses/:id
-// ============================================================
-
-router.put("/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense ID",
-      });
-    }
-
-    const existing = await db.query(
-      `
-      SELECT *
-      FROM personal_expenses
-      WHERE id = $1
-        AND user_id = $2
-      `,
-      [id, req.userId]
-    );
-
-    if (existing.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Expense not found",
-      });
-    }
-
-    const old = existing.rows[0];
-
-    const {
-      category,
-      amount,
-      expense_date,
-      notes,
-      month,
-    } = req.body;
-
-    const finalCategory =
-      category !== undefined
-        ? String(category).trim()
-        : old.category;
-
-    const finalAmount =
-      amount !== undefined
-        ? parseAmount(amount)
-        : Number(old.amount);
-
-    const finalDate =
-      expense_date !== undefined
-        ? expense_date
-        : old.expense_date;
-
-    if (!finalCategory) {
-      return res.status(400).json({
-        success: false,
-        message: "Expense category is required",
-      });
-    }
-
-    if (finalAmount === null || finalAmount <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Amount must be greater than 0",
-      });
-    }
-
-    if (!isValidDate(String(finalDate))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense date",
-      });
-    }
-
-    // If month is provided, date must stay in that selected month.
-    // Otherwise use the month of the final expense date.
-    const selectedMonth =
-      month ||
-      String(finalDate).slice(0, 7);
-
-    const range = getMonthRange(selectedMonth);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    if (
-      finalDate < range.monthStart ||
-      finalDate >= range.nextMonthStart
-    ) {
-      return res.status(400).json({
-        success: false,
-        message:
-          "Expense date must belong to the selected month",
-      });
-    }
-
-    const finalNotes =
-      notes !== undefined
-        ? notes
-        : old.notes;
-
-    const result = await db.query(
-      `
-      UPDATE personal_expenses
-      SET
-        category = $1,
-        amount = $2,
-        expense_date = $3,
-        notes = $4
-      WHERE id = $5
-        AND user_id = $6
-      RETURNING *
-      `,
-      [
-        finalCategory,
-        finalAmount,
-        finalDate,
-        finalNotes || null,
-        id,
-        req.userId,
-      ]
-    );
-
-    const updated = result.rows[0];
-
-    return res.json({
-      success: true,
-      message: "Expense updated successfully",
-      data: {
-        ...updated,
-        week: getWeekNumber(updated.expense_date),
-      },
-    });
-  } catch (error) {
-    console.error("❌ Update expense error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update expense",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 5. DELETE EXPENSE
-// DELETE /api/expenses/:id
-// ============================================================
-
-router.delete("/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid expense ID",
-      });
-    }
-
-    const result = await db.query(
-      `
-      DELETE FROM personal_expenses
-      WHERE id = $1
-        AND user_id = $2
-      RETURNING *
-      `,
-      [id, req.userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Expense not found",
-      });
-    }
-
-    return res.json({
-      success: true,
-      message: "Expense deleted successfully",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Delete expense error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to delete expense",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 6. MONTHLY SUMMARY
-// GET /api/expenses/monthly-summary?month=2026-08
-//
-// Returns:
-// - Total month expense
-// - Week 1-5 totals
-// - Category totals
-// - Category + weekly breakdown
-// ============================================================
-
-router.get("/monthly-summary", authenticate, async (req, res) => {
-  try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    // Weekly totals.
-    const weeklyResult = await db.query(
+    const weekTotalsResult = await db.query(
       `
       SELECT
         CASE
@@ -709,463 +340,376 @@ router.get("/monthly-summary", authenticate, async (req, res) => {
           WHEN EXTRACT(DAY FROM expense_date) BETWEEN 22 AND 28 THEN 4
           ELSE 5
         END AS week,
-
-        COALESCE(SUM(amount), 0) AS total
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY week
-      ORDER BY week
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-    // Category totals.
-    const categoryResult = await db.query(
-      `
-      SELECT
-        category,
         COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY category
-      ORDER BY total DESC, category ASC
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-    // Category + week combined breakdown.
-    const categoryWeekResult = await db.query(
-      `
-      SELECT
-        category,
-
-        COALESCE(
-          SUM(
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 1 AND 7
-              THEN amount ELSE 0
-            END
-          ),
-          0
-        ) AS week_1,
-
-        COALESCE(
-          SUM(
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 8 AND 14
-              THEN amount ELSE 0
-            END
-          ),
-          0
-        ) AS week_2,
-
-        COALESCE(
-          SUM(
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 15 AND 21
-              THEN amount ELSE 0
-            END
-          ),
-          0
-        ) AS week_3,
-
-        COALESCE(
-          SUM(
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 22 AND 28
-              THEN amount ELSE 0
-            END
-          ),
-          0
-        ) AS week_4,
-
-        COALESCE(
-          SUM(
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) >= 29
-              THEN amount ELSE 0
-            END
-          ),
-          0
-        ) AS week_5,
-
-        COALESCE(SUM(amount), 0) AS total
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY category
-
-      ORDER BY total DESC, category ASC
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-    const totalResult = await db.query(
-      `
-      SELECT
-        COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count
+        COUNT(*)::INTEGER AS entries
       FROM personal_expenses
       WHERE user_id = $1
         AND expense_date >= $2::DATE
         AND expense_date < $3::DATE
+      GROUP BY 1
+      ORDER BY 1
       `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
+      [userId, start, next]
     );
 
-    const weekMap = new Map(
-      weeklyResult.rows.map((row) => [
-        Number(row.week),
-        Number(row.total),
-      ])
+    const expenses = expensesResult.rows;
+
+    const selectedWeekTotal = expenses.reduce(
+      (sum, item) => sum + Number(item.amount || 0),
+      0
     );
 
-    const weekly = [1, 2, 3, 4, 5].map((week) => ({
-      week,
-      total: weekMap.get(week) || 0,
-    }));
-
-    return res.json({
+    res.json({
       success: true,
       month,
+      selectedWeek: week,
 
-      total: Number(totalResult.rows[0].total || 0),
-      count: Number(totalResult.rows[0].count || 0),
+      expenses,
+      data: expenses,
+      rows: expenses,
 
-      weekly,
+      summary: {
+        monthTotal: Number(monthResult.rows[0]?.total || 0),
+        monthEntries: Number(monthResult.rows[0]?.entries || 0),
 
-      categories: categoryResult.rows.map((row) => ({
-        category: row.category,
-        total: Number(row.total || 0),
-        count: Number(row.count || 0),
-      })),
+        selectedWeekTotal,
+        selectedWeekEntries: expenses.length,
 
-      category_weekly: categoryWeekResult.rows.map((row) => ({
-        category: row.category,
-        week_1: Number(row.week_1 || 0),
-        week_2: Number(row.week_2 || 0),
-        week_3: Number(row.week_3 || 0),
-        week_4: Number(row.week_4 || 0),
-        week_5: Number(row.week_5 || 0),
-        total: Number(row.total || 0),
-      })),
+        categoryTotals: categoryResult.rows.map((row) => ({
+          category: row.category,
+          total: Number(row.total || 0),
+          entries: Number(row.entries || 0),
+        })),
+
+        weekTotals: weekTotalsResult.rows.map((row) => ({
+          week: Number(row.week),
+          total: Number(row.total || 0),
+          entries: Number(row.entries || 0),
+        })),
+      },
     });
   } catch (error) {
-    console.error("❌ Monthly expense summary error:", error);
+    console.error("GET expenses error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to calculate monthly expense summary",
-      error: error.message,
+      message: "Failed to load expenses.",
+      error: process.env.NODE_ENV === "development" ? error.message : undefined,
     });
   }
 });
 
-// ============================================================
-// 7. WEEKLY SUMMARY
-// GET /api/expenses/weekly-summary?month=2026-08&week=1
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| GET monthly summary
+|--------------------------------------------------------------------------
+*/
 
-router.get("/weekly-summary", authenticate, async (req, res) => {
+router.get("/summary", requireUser, async (req, res) => {
   try {
-    const month = req.query.month || getCurrentMonth();
-    const week = Number(req.query.week);
+    const month = String(req.query.month || currentMonth());
 
-    const range = getMonthRange(month);
-
-    if (!range) {
+    if (!validMonth(month)) {
       return res.status(400).json({
         success: false,
         message: "Invalid month. Use YYYY-MM.",
       });
     }
 
-    if (
-      !Number.isInteger(week) ||
-      week < 1 ||
-      week > 5
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Week must be between 1 and 5",
-      });
-    }
+    const { start, next } = monthRange(month);
 
-    const weekStartDay =
-      week === 1 ? 1 :
-      week === 2 ? 8 :
-      week === 3 ? 15 :
-      week === 4 ? 22 :
-      29;
-
-    const weekEndDay =
-      week === 1 ? 8 :
-      week === 2 ? 15 :
-      week === 3 ? 22 :
-      week === 4 ? 29 :
-      null;
-
-    let dateCondition = `
-      AND EXTRACT(DAY FROM expense_date) >= ${weekStartDay}
-    `;
-
-    if (weekEndDay) {
-      dateCondition += `
-        AND EXTRACT(DAY FROM expense_date) < ${weekEndDay}
-      `;
-    }
-
-    const totalResult = await db.query(
+    const result = await db.query(
       `
       SELECT
         COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count
-
+        COUNT(*)::INTEGER AS entries,
+        COUNT(DISTINCT category)::INTEGER AS categories
       FROM personal_expenses
-
       WHERE user_id = $1
         AND expense_date >= $2::DATE
         AND expense_date < $3::DATE
-
-        ${dateCondition}
       `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
+      [req.userId, start, next]
     );
 
-    const categoryResult = await db.query(
-      `
-      SELECT
-        category,
-        COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-        ${dateCondition}
-
-      GROUP BY category
-      ORDER BY total DESC, category ASC
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-    return res.json({
+    res.json({
       success: true,
-
       month,
-      week,
-
-      total: Number(totalResult.rows[0].total || 0),
-      count: Number(totalResult.rows[0].count || 0),
-
-      categories: categoryResult.rows.map((row) => ({
-        category: row.category,
-        total: Number(row.total || 0),
-        count: Number(row.count || 0),
-      })),
+      summary: {
+        total: Number(result.rows[0]?.total || 0),
+        entries: Number(result.rows[0]?.entries || 0),
+        categories: Number(result.rows[0]?.categories || 0),
+      },
     });
   } catch (error) {
-    console.error("❌ Weekly expense summary error:", error);
+    console.error("GET expense summary error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to calculate weekly expense summary",
-      error: error.message,
+      message: "Failed to load expense summary.",
     });
   }
 });
 
-// ============================================================
-// 8. CATEGORY SUMMARY
-// GET /api/expenses/category-summary?month=2026-08
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| POST add expense
+|--------------------------------------------------------------------------
+*/
 
-router.get("/category-summary", authenticate, async (req, res) => {
+router.post("/", requireUser, async (req, res) => {
   try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
+    const category = String(req.body.category || "").trim();
+    const amount = normalizeAmount(req.body.amount);
+    const expenseDate = String(
+      req.body.expenseDate || today()
+    );
+    const notes =
+      req.body.notes === null ||
+      req.body.notes === undefined
+        ? null
+        : String(req.body.notes).trim() || null;
 
-    if (!range) {
+    if (!category) {
       return res.status(400).json({
         success: false,
-        message: "Invalid month. Use YYYY-MM.",
+        message: "Expense category is required.",
+      });
+    }
+
+    if (category.length > 100) {
+      return res.status(400).json({
+        success: false,
+        message: "Category cannot exceed 100 characters.",
+      });
+    }
+
+    if (amount === null) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be greater than 0.",
+      });
+    }
+
+    if (!validDate(expenseDate)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense date. Use YYYY-MM-DD.",
       });
     }
 
     const result = await db.query(
       `
-      SELECT
+      INSERT INTO personal_expenses (
+        user_id,
         category,
-        COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count,
-        MIN(expense_date) AS first_expense_date,
-        MAX(expense_date) AS last_expense_date
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY category
-
-      ORDER BY total DESC, category ASC
+        amount,
+        expense_date,
+        notes,
+        created_at,
+        updated_at
+      )
+      VALUES (
+        $1,
+        $2,
+        $3,
+        $4::DATE,
+        $5,
+        CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+      )
+      RETURNING
+        id,
+        user_id,
+        category,
+        amount,
+        expense_date,
+        notes,
+        created_at,
+        updated_at
       `,
       [
         req.userId,
-        range.monthStart,
-        range.nextMonthStart,
+        category,
+        amount,
+        expenseDate,
+        notes,
       ]
     );
 
-    return res.json({
+    res.status(201).json({
       success: true,
-      month,
-      count: result.rows.length,
-
-      data: result.rows.map((row) => ({
-        category: row.category,
-        total: Number(row.total || 0),
-        count: Number(row.count || 0),
-        first_expense_date: row.first_expense_date,
-        last_expense_date: row.last_expense_date,
-      })),
+      message: "Expense added successfully.",
+      expense: result.rows[0],
     });
   } catch (error) {
-    console.error("❌ Category summary error:", error);
+    console.error("POST expense error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to calculate category summary",
-      error: error.message,
+      message: "Failed to add expense.",
     });
   }
 });
 
-// ============================================================
-// 9. CURRENT MONTH TOTAL
-// GET /api/expenses/current-month
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| PUT update expense
+|--------------------------------------------------------------------------
+*/
 
-router.get("/current-month", authenticate, async (req, res) => {
+router.put("/:id", requireUser, async (req, res) => {
   try {
-    const month = getCurrentMonth();
-    const range = getMonthRange(month);
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID.",
+      });
+    }
+
+    const category = String(req.body.category || "").trim();
+    const amount = normalizeAmount(req.body.amount);
+
+    const expenseDate =
+      req.body.expenseDate === undefined ||
+      req.body.expenseDate === null ||
+      req.body.expenseDate === ""
+        ? null
+        : String(req.body.expenseDate);
+
+    const notes =
+      req.body.notes === null ||
+      req.body.notes === undefined
+        ? null
+        : String(req.body.notes).trim() || null;
+
+    if (!category) {
+      return res.status(400).json({
+        success: false,
+        message: "Expense category is required.",
+      });
+    }
+
+    if (amount === null) {
+      return res.status(400).json({
+        success: false,
+        message: "Amount must be greater than 0.",
+      });
+    }
+
+    if (expenseDate && !validDate(expenseDate)) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense date. Use YYYY-MM-DD.",
+      });
+    }
 
     const result = await db.query(
       `
-      SELECT
-        COALESCE(SUM(amount), 0) AS total,
-        COUNT(*)::INTEGER AS count
-      FROM personal_expenses
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
+      UPDATE personal_expenses
+      SET
+        category = $1,
+        amount = $2,
+        expense_date = COALESCE($3::DATE, expense_date),
+        notes = $4,
+        updated_at = CURRENT_TIMESTAMP
+      WHERE id = $5
+        AND user_id = $6
+      RETURNING
+        id,
+        user_id,
+        category,
+        amount,
+        expense_date,
+        notes,
+        created_at,
+        updated_at
       `,
       [
+        category,
+        amount,
+        expenseDate,
+        notes,
+        id,
         req.userId,
-        range.monthStart,
-        range.nextMonthStart,
       ]
     );
 
-    return res.json({
+    if (!result.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found.",
+      });
+    }
+
+    res.json({
       success: true,
-      month,
-      total: Number(result.rows[0].total || 0),
-      count: Number(result.rows[0].count || 0),
+      message: "Expense updated successfully.",
+      expense: result.rows[0],
     });
   } catch (error) {
-    console.error("❌ Current month expense error:", error);
+    console.error("PUT expense error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to load current month expense",
-      error: error.message,
+      message: "Failed to update expense.",
     });
   }
 });
 
-// ============================================================
-// 10. AVAILABLE CATEGORIES
-// GET /api/expenses/categories
-//
-// Returns categories already used by the user.
-// Frontend can also provide its standard categories.
-// ============================================================
+/*
+|--------------------------------------------------------------------------
+| DELETE expense
+|--------------------------------------------------------------------------
+*/
 
-router.get("/categories", authenticate, async (req, res) => {
+router.delete("/:id", requireUser, async (req, res) => {
   try {
+    const id = Number(req.params.id);
+
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid expense ID.",
+      });
+    }
+
     const result = await db.query(
       `
-      SELECT DISTINCT category
-      FROM personal_expenses
-      WHERE user_id = $1
-      ORDER BY category ASC
+      DELETE FROM personal_expenses
+      WHERE id = $1
+        AND user_id = $2
+      RETURNING
+        id,
+        category,
+        amount,
+        expense_date
       `,
-      [req.userId]
+      [id, req.userId]
     );
 
-    return res.json({
+    if (!result.rows.length) {
+      return res.status(404).json({
+        success: false,
+        message: "Expense not found.",
+      });
+    }
+
+    res.json({
       success: true,
-      data: result.rows.map((row) => row.category),
+      message: "Expense deleted successfully.",
+      expense: result.rows[0],
     });
   } catch (error) {
-    console.error("❌ Expense categories error:", error);
+    console.error("DELETE expense error:", error);
 
-    return res.status(500).json({
+    res.status(500).json({
       success: false,
-      message: "Failed to load expense categories",
-      error: error.message,
+      message: "Failed to delete expense.",
     });
   }
 });
-
-// ============================================================
-// EXPORT
-// ============================================================
 
 module.exports = router;

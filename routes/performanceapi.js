@@ -1,7 +1,10 @@
 // routes/performanceApi.js
 // Performance API
-// Weekly + monthly financial performance
-// Uses data from Expenses, Loan/Borrow repayments and Payments.
+// Weekly + selected-month financial performance + yearly monthly performance + pie chart
+// Uses:
+//   personal_expenses
+//   personal_loan_emi_payments
+//   personal_payments
 // PostgreSQL + Express + JWT
 
 const express = require("express");
@@ -27,17 +30,23 @@ const authenticate = (req, res, next) => {
       });
     }
 
-    const token = header.substring(7);
+    const token = header.substring(7).trim();
     const decoded = jwt.verify(token, JWT_SECRET);
 
-    if (!decoded?.id) {
+    const userId = Number(
+      decoded?.id ??
+      decoded?.userId ??
+      decoded?.sub
+    );
+
+    if (!Number.isInteger(userId) || userId <= 0) {
       return res.status(401).json({
         success: false,
         message: "Invalid authentication token",
       });
     }
 
-    req.userId = Number(decoded.id);
+    req.userId = userId;
     next();
   } catch (error) {
     return res.status(401).json({
@@ -54,19 +63,17 @@ const authenticate = (req, res, next) => {
 const getCurrentMonth = () => {
   const now = new Date();
 
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+  return `${now.getFullYear()}-${String(
+    now.getMonth() + 1
+  ).padStart(2, "0")}`;
 };
 
 const getMonthRange = (month) => {
-  if (!/^\d{4}-\d{2}$/.test(month || "")) {
+  if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month || "")) {
     return null;
   }
 
   const [year, monthNumber] = month.split("-").map(Number);
-
-  if (monthNumber < 1 || monthNumber > 12) {
-    return null;
-  }
 
   const monthStart =
     `${year}-${String(monthNumber).padStart(2, "0")}-01`;
@@ -86,395 +93,515 @@ const getMonthRange = (month) => {
   };
 };
 
-const toNumber = (value) => Number(value || 0);
+const toNumber = (value) => {
+  const number = Number(value || 0);
 
-const emptyWeek = (week) => ({
-  week,
+  return Number.isFinite(number) ? number : 0;
+};
 
-  expenses: 0,
+const monthName = (month) => {
+  const [year, monthNumber] = month.split("-").map(Number);
 
-  loan_emi: 0,
-  loan_repayment: 0,
-  borrow_repayment: 0,
-  total_repayment: 0,
+  return new Date(
+    Date.UTC(year, monthNumber - 1, 1)
+  ).toLocaleString("en-US", {
+    month: "long",
+    year: "numeric",
+    timeZone: "UTC",
+  });
+};
 
-  received_payment: 0,
-  pending_payment: 0,
-  overdue_payment: 0,
-  lost_payment: 0,
+const createWeeks = () => [
+  {
+    week: 1,
+    label: "Week 1",
+    date_range: "1-7",
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+    status: "No Activity",
+  },
+  {
+    week: 2,
+    label: "Week 2",
+    date_range: "8-14",
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+    status: "No Activity",
+  },
+  {
+    week: 3,
+    label: "Week 3",
+    date_range: "15-21",
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+    status: "No Activity",
+  },
+  {
+    week: 4,
+    label: "Week 4",
+    date_range: "22-28",
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+    status: "No Activity",
+  },
+  {
+    week: 5,
+    label: "Week 5",
+    date_range: "29-end",
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+    status: "No Activity",
+  },
+];
 
-  total_income: 0,
-  total_outgoing: 0,
+const calculateWeek = (week) => {
+  week.total_loans =
+    week.loan_emi +
+    week.loan_repayment;
 
-  net: 0,
-  status: "No Activity",
-});
+  week.total_income = week.received_payment;
+
+  week.total_outgoing =
+    week.expenses +
+    week.total_loans +
+    week.borrow_repayment;
+
+  week.net =
+    week.total_income -
+    week.total_outgoing;
+
+  if (
+    week.total_income === 0 &&
+    week.total_outgoing === 0
+  ) {
+    week.status = "No Activity";
+  } else if (week.net > 0) {
+    week.status = "Profit";
+  } else if (week.net < 0) {
+    week.status = "Loss";
+  } else {
+    week.status = "Break Even";
+  }
+
+  return week;
+};
+
+const calculateTotals = (weeks) => {
+  const totals = {
+    expenses: 0,
+    loan_emi: 0,
+    loan_repayment: 0,
+    borrow_repayment: 0,
+    total_loans: 0,
+    received_payment: 0,
+    pending_payment: 0,
+    overdue_payment: 0,
+    lost_payment: 0,
+    total_income: 0,
+    total_outgoing: 0,
+    net: 0,
+  };
+
+  weeks.forEach((week) => {
+    Object.keys(totals).forEach((key) => {
+      totals[key] += toNumber(week[key]);
+    });
+  });
+
+  let status = "No Activity";
+
+  if (
+    totals.total_income === 0 &&
+    totals.total_outgoing === 0
+  ) {
+    status = "No Activity";
+  } else if (totals.net > 0) {
+    status = "Profit";
+  } else if (totals.net < 0) {
+    status = "Loss";
+  } else {
+    status = "Break Even";
+  }
+
+  return {
+    ...totals,
+    status,
+  };
+};
 
 // ============================================================
-// 1. WEEKLY PERFORMANCE
-// GET /api/performance/weekly?month=2026-08
-//
-// Week definition:
-// Week 1 = 1-7
-// Week 2 = 8-14
-// Week 3 = 15-21
-// Week 4 = 22-28
-// Week 5 = 29-end
-//
-// Includes:
-// Expenses
-// Loan/borrow repayments
-// Received/pending/overdue/lost payments
-// Net result
+// COMMON SELECTED-MONTH DATA
 // ============================================================
 
-router.get("/weekly", authenticate, async (req, res) => {
+const getSelectedMonthData = async (userId, month) => {
+  const range = getMonthRange(month);
+
+  if (!range) {
+    const error = new Error("Invalid month. Use YYYY-MM.");
+    error.statusCode = 400;
+    throw error;
+  }
+
+  const weeks = createWeeks();
+
+  const [expenseResult, repaymentResult, paymentResult] =
+    await Promise.all([
+      db.query(
+        `
+        SELECT
+          CASE
+            WHEN EXTRACT(DAY FROM expense_date) BETWEEN 1 AND 7 THEN 1
+            WHEN EXTRACT(DAY FROM expense_date) BETWEEN 8 AND 14 THEN 2
+            WHEN EXTRACT(DAY FROM expense_date) BETWEEN 15 AND 21 THEN 3
+            WHEN EXTRACT(DAY FROM expense_date) BETWEEN 22 AND 28 THEN 4
+            ELSE 5
+          END AS week,
+          COALESCE(SUM(amount), 0) AS total
+        FROM personal_expenses
+        WHERE user_id = $1
+          AND expense_date >= $2::DATE
+          AND expense_date < $3::DATE
+        GROUP BY week
+        ORDER BY week
+        `,
+        [userId, range.monthStart, range.nextMonthStart]
+      ),
+
+      db.query(
+        `
+        SELECT
+          CASE
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7 THEN 1
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14 THEN 2
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21 THEN 3
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28 THEN 4
+            ELSE 5
+          END AS week,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'EMI'
+            ),
+            0
+          ) AS loan_emi,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'Loan Repayment'
+            ),
+            0
+          ) AS loan_repayment,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'Borrow Repayment'
+            ),
+            0
+          ) AS borrow_repayment
+
+        FROM personal_loan_emi_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        GROUP BY week
+        ORDER BY week
+        `,
+        [userId, range.monthStart, range.nextMonthStart]
+      ),
+
+      db.query(
+        `
+        SELECT
+          CASE
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7 THEN 1
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14 THEN 2
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21 THEN 3
+            WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28 THEN 4
+            ELSE 5
+          END AS week,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Received'
+            ),
+            0
+          ) AS received,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Pending'
+            ),
+            0
+          ) AS pending,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Overdue'
+            ),
+            0
+          ) AS overdue,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Lost'
+            ),
+            0
+          ) AS lost
+
+        FROM personal_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        GROUP BY week
+        ORDER BY week
+        `,
+        [userId, range.monthStart, range.nextMonthStart]
+      ),
+    ]);
+
+  expenseResult.rows.forEach((row) => {
+    const week = Number(row.week);
+
+    if (weeks[week - 1]) {
+      weeks[week - 1].expenses = toNumber(row.total);
+    }
+  });
+
+  repaymentResult.rows.forEach((row) => {
+    const week = Number(row.week);
+
+    if (weeks[week - 1]) {
+      weeks[week - 1].loan_emi = toNumber(row.loan_emi);
+      weeks[week - 1].loan_repayment =
+        toNumber(row.loan_repayment);
+      weeks[week - 1].borrow_repayment =
+        toNumber(row.borrow_repayment);
+    }
+  });
+
+  paymentResult.rows.forEach((row) => {
+    const week = Number(row.week);
+
+    if (weeks[week - 1]) {
+      weeks[week - 1].received_payment =
+        toNumber(row.received);
+
+      weeks[week - 1].pending_payment =
+        toNumber(row.pending);
+
+      weeks[week - 1].overdue_payment =
+        toNumber(row.overdue);
+
+      weeks[week - 1].lost_payment =
+        toNumber(row.lost);
+    }
+  });
+
+  weeks.forEach(calculateWeek);
+
+  const totals = calculateTotals(weeks);
+
+  return {
+    month,
+    month_name: monthName(month),
+    month_start: range.monthStart,
+    month_end: range.nextMonthStart,
+    weekly: weeks,
+    totals,
+  };
+};
+
+// ============================================================
+// 1. SELECTED MONTH COMPLETE PERFORMANCE
+// GET /api/performance?month=2026-08
+//
+// Main endpoint for Performance.jsx.
+// Gives all selected-month details + weekly breakdown.
+// ============================================================
+
+router.get("/", authenticate, async (req, res) => {
   try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    const weeks = [1, 2, 3, 4, 5].map(emptyWeek);
-
-    // --------------------------------------------------------
-    // Expenses
-    // --------------------------------------------------------
-
-    const expenseResult = await db.query(
-      `
-      SELECT
-        CASE
-          WHEN EXTRACT(DAY FROM expense_date) BETWEEN 1 AND 7
-            THEN 1
-          WHEN EXTRACT(DAY FROM expense_date) BETWEEN 8 AND 14
-            THEN 2
-          WHEN EXTRACT(DAY FROM expense_date) BETWEEN 15 AND 21
-            THEN 3
-          WHEN EXTRACT(DAY FROM expense_date) BETWEEN 22 AND 28
-            THEN 4
-          ELSE 5
-        END AS week,
-
-        COALESCE(SUM(amount), 0) AS total
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY week
-      ORDER BY week
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
+    const month = String(
+      req.query.month || getCurrentMonth()
     );
 
-    expenseResult.rows.forEach((row) => {
-      const week = Number(row.week);
-
-      if (weeks[week - 1]) {
-        weeks[week - 1].expenses = toNumber(row.total);
-      }
-    });
-
-    // --------------------------------------------------------
-    // Loan / Borrow repayments
-    // --------------------------------------------------------
-
-    const repaymentResult = await db.query(
-      `
-      SELECT
-        CASE
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7
-            THEN 1
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14
-            THEN 2
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21
-            THEN 3
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28
-            THEN 4
-          ELSE 5
-        END AS week,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'EMI'
-          ),
-          0
-        ) AS loan_emi,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Loan Repayment'
-          ),
-          0
-        ) AS loan_repayment,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Borrow Repayment'
-          ),
-          0
-        ) AS borrow_repayment,
-
-        COALESCE(SUM(amount), 0) AS total_repayment
-
-      FROM personal_loan_emi_payments
-
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-
-      GROUP BY week
-      ORDER BY week
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
+    const data = await getSelectedMonthData(
+      req.userId,
+      month
     );
-
-    repaymentResult.rows.forEach((row) => {
-      const week = Number(row.week);
-
-      if (weeks[week - 1]) {
-        weeks[week - 1].loan_emi =
-          toNumber(row.loan_emi);
-
-        weeks[week - 1].loan_repayment =
-          toNumber(row.loan_repayment);
-
-        weeks[week - 1].borrow_repayment =
-          toNumber(row.borrow_repayment);
-
-        weeks[week - 1].total_repayment =
-          toNumber(row.total_repayment);
-      }
-    });
-
-    // --------------------------------------------------------
-    // Payments
-    // --------------------------------------------------------
-
-    const paymentResult = await db.query(
-      `
-      SELECT
-        CASE
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7
-            THEN 1
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14
-            THEN 2
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21
-            THEN 3
-          WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28
-            THEN 4
-          ELSE 5
-        END AS week,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE status = 'Received'
-          ),
-          0
-        ) AS received,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE status = 'Pending'
-          ),
-          0
-        ) AS pending,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE status = 'Overdue'
-          ),
-          0
-        ) AS overdue,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE status = 'Lost'
-          ),
-          0
-        ) AS lost
-
-      FROM personal_payments
-
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-
-      GROUP BY week
-      ORDER BY week
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-    paymentResult.rows.forEach((row) => {
-      const week = Number(row.week);
-
-      if (weeks[week - 1]) {
-        weeks[week - 1].received_payment =
-          toNumber(row.received);
-
-        weeks[week - 1].pending_payment =
-          toNumber(row.pending);
-
-        weeks[week - 1].overdue_payment =
-          toNumber(row.overdue);
-
-        weeks[week - 1].lost_payment =
-          toNumber(row.lost);
-      }
-    });
-
-    // --------------------------------------------------------
-    // Calculate final weekly results
-    // --------------------------------------------------------
-
-    weeks.forEach((week) => {
-      week.total_income = week.received_payment;
-
-      week.total_outgoing =
-        week.expenses +
-        week.loan_emi +
-        week.loan_repayment +
-        week.borrow_repayment;
-
-      week.net =
-        week.total_income -
-        week.total_outgoing;
-
-      if (
-        week.total_income === 0 &&
-        week.total_outgoing === 0
-      ) {
-        week.status = "No Activity";
-      } else if (week.net > 0) {
-        week.status = "Profit";
-      } else if (week.net < 0) {
-        week.status = "Loss";
-      } else {
-        week.status = "Break Even";
-      }
-    });
-
-    // --------------------------------------------------------
-    // Monthly totals from weekly data
-    // --------------------------------------------------------
-
-    const totals = weeks.reduce(
-      (acc, week) => {
-        acc.expenses += week.expenses;
-        acc.loan_emi += week.loan_emi;
-        acc.loan_repayment += week.loan_repayment;
-        acc.borrow_repayment += week.borrow_repayment;
-        acc.total_repayment += week.total_repayment;
-
-        acc.received_payment += week.received_payment;
-        acc.pending_payment += week.pending_payment;
-        acc.overdue_payment += week.overdue_payment;
-        acc.lost_payment += week.lost_payment;
-
-        acc.total_income += week.total_income;
-        acc.total_outgoing += week.total_outgoing;
-        acc.net += week.net;
-
-        return acc;
-      },
-      {
-        expenses: 0,
-        loan_emi: 0,
-        loan_repayment: 0,
-        borrow_repayment: 0,
-        total_repayment: 0,
-        received_payment: 0,
-        pending_payment: 0,
-        overdue_payment: 0,
-        lost_payment: 0,
-        total_income: 0,
-        total_outgoing: 0,
-        net: 0,
-      }
-    );
-
-    let monthlyStatus = "No Activity";
-
-    if (
-      totals.total_income === 0 &&
-      totals.total_outgoing === 0
-    ) {
-      monthlyStatus = "No Activity";
-    } else if (totals.net > 0) {
-      monthlyStatus = "Profit";
-    } else if (totals.net < 0) {
-      monthlyStatus = "Loss";
-    } else {
-      monthlyStatus = "Break Even";
-    }
 
     return res.json({
       success: true,
 
-      month,
+      title: "Performance",
 
-      weekly: weeks,
+      description:
+        `Weekly financial performance and selected-month activity for ${data.month_name}.`,
 
-      totals: {
-        ...totals,
-        status: monthlyStatus,
+      month: data.month,
+      month_name: data.month_name,
+
+      weekly: data.weekly,
+
+      totals: data.totals,
+
+      monthlyPerformance: {
+        title: "Monthly Performance",
+        description:
+          `Combined weekly activity for ${data.month_name}.`,
+        weeks: data.weekly,
+        totals: data.totals,
       },
 
-      chart: {
-        income: totals.total_income,
-        expenses: totals.expenses,
-        loan_repayment:
-          totals.loan_emi +
-          totals.loan_repayment,
-        borrow_repayment:
-          totals.borrow_repayment,
+      cards: {
+        expenses: data.totals.expenses,
+        loans: data.totals.total_loans,
+        borrow: data.totals.borrow_repayment,
+        received: data.totals.received_payment,
+        pending: data.totals.pending_payment,
       },
+
+      pie: [
+        {
+          label: "Expenses",
+          value: data.totals.expenses,
+        },
+        {
+          label: "Loans",
+          value: data.totals.total_loans,
+        },
+        {
+          label: "Borrow",
+          value: data.totals.borrow_repayment,
+        },
+        {
+          label: "Received",
+          value: data.totals.received_payment,
+        },
+        {
+          label: "Pending",
+          value: data.totals.pending_payment,
+        },
+      ],
     });
   } catch (error) {
-    console.error("❌ Weekly performance error:", error);
+    console.error("❌ Selected month performance error:", error);
 
-    return res.status(500).json({
+    return res.status(error.statusCode || 500).json({
       success: false,
-      message: "Failed to calculate weekly performance",
-      error: error.message,
+      message:
+        error.statusCode === 400
+          ? error.message
+          : "Failed to calculate performance",
+      error:
+        process.env.NODE_ENV === "development"
+          ? error.message
+          : undefined,
     });
   }
 });
 
 // ============================================================
-// 2. MONTHLY PERFORMANCE
+// 2. WEEKLY PERFORMANCE
+// GET /api/performance/weekly?month=2026-08
+// ============================================================
+
+router.get("/weekly", authenticate, async (req, res) => {
+  try {
+    const month = String(
+      req.query.month || getCurrentMonth()
+    );
+
+    const data = await getSelectedMonthData(
+      req.userId,
+      month
+    );
+
+    return res.json({
+      success: true,
+      month: data.month,
+      month_name: data.month_name,
+
+      title: "Weekly Performance",
+
+      weekly: data.weekly,
+
+      totals: data.totals,
+    });
+  } catch (error) {
+    console.error("❌ Weekly performance error:", error);
+
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message:
+        error.statusCode === 400
+          ? error.message
+          : "Failed to calculate weekly performance",
+    });
+  }
+});
+
+// ============================================================
+// 3. MONTHLY PERFORMANCE
 // GET /api/performance/monthly?year=2026
 //
-// All months of selected year.
-// Useful for the monthly performance chart.
+// Gives January-December performance for selected year.
 // ============================================================
 
 router.get("/monthly", authenticate, async (req, res) => {
   try {
     const year = Number(
-      req.query.year ||
-      new Date().getFullYear()
+      req.query.year || new Date().getFullYear()
     );
 
     if (
@@ -493,176 +620,159 @@ router.get("/monthly", authenticate, async (req, res) => {
 
     const months = Array.from(
       { length: 12 },
-      (_, index) => {
-        return {
-          month: index + 1,
-          month_name: new Date(
-            Date.UTC(year, index, 1)
-          ).toLocaleString("en-US", {
-            month: "long",
-            timeZone: "UTC",
-          }),
+      (_, index) => ({
+        month: index + 1,
+        month_name: new Date(
+          Date.UTC(year, index, 1)
+        ).toLocaleString("en-US", {
+          month: "long",
+          timeZone: "UTC",
+        }),
 
-          income: 0,
-          expenses: 0,
-          loan_emi: 0,
-          loan_repayment: 0,
-          borrow_repayment: 0,
-
-          total_outgoing: 0,
-          net: 0,
-          status: "No Activity",
-        };
-      }
+        income: 0,
+        expenses: 0,
+        loan_emi: 0,
+        loan_repayment: 0,
+        borrow_repayment: 0,
+        loans: 0,
+        total_outgoing: 0,
+        net: 0,
+        status: "No Activity",
+      })
     );
 
-    // --------------------------------------------------------
-    // Received payments by month
-    // --------------------------------------------------------
+    const [
+      paymentResult,
+      expenseResult,
+      repaymentResult,
+    ] = await Promise.all([
+      db.query(
+        `
+        SELECT
+          EXTRACT(MONTH FROM payment_date)::INTEGER AS month,
 
-    const paymentResult = await db.query(
-      `
-      SELECT
-        EXTRACT(MONTH FROM payment_date)::INTEGER AS month,
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Received'
+            ),
+            0
+          ) AS income
 
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE status = 'Received'
-          ),
-          0
-        ) AS income
+        FROM personal_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        GROUP BY month
+        ORDER BY month
+        `,
+        [
+          req.userId,
+          yearStart,
+          nextYearStart,
+        ]
+      ),
 
-      FROM personal_payments
+      db.query(
+        `
+        SELECT
+          EXTRACT(MONTH FROM expense_date)::INTEGER AS month,
+          COALESCE(SUM(amount), 0) AS expenses
+        FROM personal_expenses
+        WHERE user_id = $1
+          AND expense_date >= $2::DATE
+          AND expense_date < $3::DATE
+        GROUP BY month
+        ORDER BY month
+        `,
+        [
+          req.userId,
+          yearStart,
+          nextYearStart,
+        ]
+      ),
 
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
+      db.query(
+        `
+        SELECT
+          EXTRACT(MONTH FROM payment_date)::INTEGER AS month,
 
-      GROUP BY month
-      ORDER BY month
-      `,
-      [
-        req.userId,
-        yearStart,
-        nextYearStart,
-      ]
-    );
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'EMI'
+            ),
+            0
+          ) AS loan_emi,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'Loan Repayment'
+            ),
+            0
+          ) AS loan_repayment,
+
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'Borrow Repayment'
+            ),
+            0
+          ) AS borrow_repayment
+
+        FROM personal_loan_emi_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        GROUP BY month
+        ORDER BY month
+        `,
+        [
+          req.userId,
+          yearStart,
+          nextYearStart,
+        ]
+      ),
+    ]);
 
     paymentResult.rows.forEach((row) => {
-      const month = Number(row.month);
+      const index = Number(row.month) - 1;
 
-      if (months[month - 1]) {
-        months[month - 1].income =
+      if (months[index]) {
+        months[index].income =
           toNumber(row.income);
       }
     });
 
-    // --------------------------------------------------------
-    // Expenses by month
-    // --------------------------------------------------------
-
-    const expenseResult = await db.query(
-      `
-      SELECT
-        EXTRACT(MONTH FROM expense_date)::INTEGER AS month,
-
-        COALESCE(SUM(amount), 0) AS expenses
-
-      FROM personal_expenses
-
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-
-      GROUP BY month
-      ORDER BY month
-      `,
-      [
-        req.userId,
-        yearStart,
-        nextYearStart,
-      ]
-    );
-
     expenseResult.rows.forEach((row) => {
-      const month = Number(row.month);
+      const index = Number(row.month) - 1;
 
-      if (months[month - 1]) {
-        months[month - 1].expenses =
+      if (months[index]) {
+        months[index].expenses =
           toNumber(row.expenses);
       }
     });
 
-    // --------------------------------------------------------
-    // Loan / Borrow repayments by month
-    // --------------------------------------------------------
-
-    const repaymentResult = await db.query(
-      `
-      SELECT
-        EXTRACT(MONTH FROM payment_date)::INTEGER AS month,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'EMI'
-          ),
-          0
-        ) AS loan_emi,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Loan Repayment'
-          ),
-          0
-        ) AS loan_repayment,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Borrow Repayment'
-          ),
-          0
-        ) AS borrow_repayment
-
-      FROM personal_loan_emi_payments
-
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-
-      GROUP BY month
-      ORDER BY month
-      `,
-      [
-        req.userId,
-        yearStart,
-        nextYearStart,
-      ]
-    );
-
     repaymentResult.rows.forEach((row) => {
-      const month = Number(row.month);
+      const index = Number(row.month) - 1;
 
-      if (months[month - 1]) {
-        months[month - 1].loan_emi =
+      if (months[index]) {
+        months[index].loan_emi =
           toNumber(row.loan_emi);
 
-        months[month - 1].loan_repayment =
+        months[index].loan_repayment =
           toNumber(row.loan_repayment);
 
-        months[month - 1].borrow_repayment =
+        months[index].borrow_repayment =
           toNumber(row.borrow_repayment);
       }
     });
 
-    // --------------------------------------------------------
-    // Calculate monthly totals
-    // --------------------------------------------------------
-
     months.forEach((month) => {
+      month.loans =
+        month.loan_emi +
+        month.loan_repayment;
+
       month.total_outgoing =
         month.expenses +
-        month.loan_emi +
-        month.loan_repayment +
+        month.loans +
         month.borrow_repayment;
 
       month.net =
@@ -689,8 +799,11 @@ router.get("/monthly", authenticate, async (req, res) => {
         acc.expenses += month.expenses;
         acc.loan_emi += month.loan_emi;
         acc.loan_repayment += month.loan_repayment;
-        acc.borrow_repayment += month.borrow_repayment;
-        acc.total_outgoing += month.total_outgoing;
+        acc.borrow_repayment +=
+          month.borrow_repayment;
+        acc.loans += month.loans;
+        acc.total_outgoing +=
+          month.total_outgoing;
         acc.net += month.net;
 
         return acc;
@@ -701,6 +814,7 @@ router.get("/monthly", authenticate, async (req, res) => {
         loan_emi: 0,
         loan_repayment: 0,
         borrow_repayment: 0,
+        loans: 0,
         total_outgoing: 0,
         net: 0,
       }
@@ -723,8 +837,12 @@ router.get("/monthly", authenticate, async (req, res) => {
 
     return res.json({
       success: true,
-
       year,
+
+      title: "Monthly Performance",
+
+      description:
+        `Monthly financial performance for ${year}.`,
 
       months,
 
@@ -735,30 +853,22 @@ router.get("/monthly", authenticate, async (req, res) => {
 
       chart: {
         labels: months.map(
-          (month) => month.month_name
+          (item) => item.month_name
         ),
-
         income: months.map(
-          (month) => month.income
+          (item) => item.income
         ),
-
         expenses: months.map(
-          (month) => month.expenses
+          (item) => item.expenses
         ),
-
-        loan_repayment: months.map(
-          (month) =>
-            month.loan_emi +
-            month.loan_repayment
+        loans: months.map(
+          (item) => item.loans
         ),
-
-        borrow_repayment: months.map(
-          (month) =>
-            month.borrow_repayment
+        borrow: months.map(
+          (item) => item.borrow_repayment
         ),
-
         net: months.map(
-          (month) => month.net
+          (item) => item.net
         ),
       },
     });
@@ -768,323 +878,28 @@ router.get("/monthly", authenticate, async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to calculate monthly performance",
-      error: error.message,
     });
   }
 });
 
 // ============================================================
-// 3. SELECTED MONTH COMPLETE PERFORMANCE
-// GET /api/performance?month=2026-08
-//
-// Combines weekly + monthly selected-month data in one response.
-// ============================================================
-
-router.get("/", authenticate, async (req, res) => {
-  try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    const weeks = [1, 2, 3, 4, 5].map(emptyWeek);
-
-    // ========================================================
-    // All weekly data in one database query per source.
-    // ========================================================
-
-    const [expenseResult, repaymentResult, paymentResult] =
-      await Promise.all([
-        db.query(
-          `
-          SELECT
-            CASE
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 1 AND 7 THEN 1
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 8 AND 14 THEN 2
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 15 AND 21 THEN 3
-              WHEN EXTRACT(DAY FROM expense_date) BETWEEN 22 AND 28 THEN 4
-              ELSE 5
-            END AS week,
-            COALESCE(SUM(amount), 0) AS total
-          FROM personal_expenses
-          WHERE user_id = $1
-            AND expense_date >= $2::DATE
-            AND expense_date < $3::DATE
-          GROUP BY week
-          ORDER BY week
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
-
-        db.query(
-          `
-          SELECT
-            CASE
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7 THEN 1
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14 THEN 2
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21 THEN 3
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28 THEN 4
-              ELSE 5
-            END AS week,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'EMI'
-              ),
-              0
-            ) AS loan_emi,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'Loan Repayment'
-              ),
-              0
-            ) AS loan_repayment,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'Borrow Repayment'
-              ),
-              0
-            ) AS borrow_repayment
-
-          FROM personal_loan_emi_payments
-
-          WHERE user_id = $1
-            AND payment_date >= $2::DATE
-            AND payment_date < $3::DATE
-
-          GROUP BY week
-          ORDER BY week
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
-
-        db.query(
-          `
-          SELECT
-            CASE
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 1 AND 7 THEN 1
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 8 AND 14 THEN 2
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 15 AND 21 THEN 3
-              WHEN EXTRACT(DAY FROM payment_date) BETWEEN 22 AND 28 THEN 4
-              ELSE 5
-            END AS week,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE status = 'Received'
-              ),
-              0
-            ) AS received,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE status = 'Pending'
-              ),
-              0
-            ) AS pending,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE status = 'Overdue'
-              ),
-              0
-            ) AS overdue,
-
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE status = 'Lost'
-              ),
-              0
-            ) AS lost
-
-          FROM personal_payments
-
-          WHERE user_id = $1
-            AND payment_date >= $2::DATE
-            AND payment_date < $3::DATE
-
-          GROUP BY week
-          ORDER BY week
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
-      ]);
-
-    expenseResult.rows.forEach((row) => {
-      const week = Number(row.week);
-      weeks[week - 1].expenses = toNumber(row.total);
-    });
-
-    repaymentResult.rows.forEach((row) => {
-      const week = Number(row.week);
-
-      weeks[week - 1].loan_emi =
-        toNumber(row.loan_emi);
-
-      weeks[week - 1].loan_repayment =
-        toNumber(row.loan_repayment);
-
-      weeks[week - 1].borrow_repayment =
-        toNumber(row.borrow_repayment);
-
-      weeks[week - 1].total_repayment =
-        weeks[week - 1].loan_emi +
-        weeks[week - 1].loan_repayment +
-        weeks[week - 1].borrow_repayment;
-    });
-
-    paymentResult.rows.forEach((row) => {
-      const week = Number(row.week);
-
-      weeks[week - 1].received_payment =
-        toNumber(row.received);
-
-      weeks[week - 1].pending_payment =
-        toNumber(row.pending);
-
-      weeks[week - 1].overdue_payment =
-        toNumber(row.overdue);
-
-      weeks[week - 1].lost_payment =
-        toNumber(row.lost);
-    });
-
-    weeks.forEach((week) => {
-      week.total_income =
-        week.received_payment;
-
-      week.total_outgoing =
-        week.expenses +
-        week.total_repayment;
-
-      week.net =
-        week.total_income -
-        week.total_outgoing;
-
-      if (
-        week.total_income === 0 &&
-        week.total_outgoing === 0
-      ) {
-        week.status = "No Activity";
-      } else if (week.net > 0) {
-        week.status = "Profit";
-      } else if (week.net < 0) {
-        week.status = "Loss";
-      } else {
-        week.status = "Break Even";
-      }
-    });
-
-    const totals = weeks.reduce(
-      (acc, week) => {
-        Object.keys(acc).forEach((key) => {
-          if (key !== "status") {
-            acc[key] += Number(week[key] || 0);
-          }
-        });
-
-        return acc;
-      },
-      {
-        expenses: 0,
-        loan_emi: 0,
-        loan_repayment: 0,
-        borrow_repayment: 0,
-        total_repayment: 0,
-        received_payment: 0,
-        pending_payment: 0,
-        overdue_payment: 0,
-        lost_payment: 0,
-        total_income: 0,
-        total_outgoing: 0,
-        net: 0,
-      }
-    );
-
-    let status = "No Activity";
-
-    if (
-      totals.total_income === 0 &&
-      totals.total_outgoing === 0
-    ) {
-      status = "No Activity";
-    } else if (totals.net > 0) {
-      status = "Profit";
-    } else if (totals.net < 0) {
-      status = "Loss";
-    } else {
-      status = "Break Even";
-    }
-
-    return res.json({
-      success: true,
-
-      month,
-
-      weekly: weeks,
-
-      totals: {
-        ...totals,
-        status,
-      },
-
-      chart: {
-        income: totals.total_income,
-        expenses: totals.expenses,
-        loan_emi: totals.loan_emi,
-        loan_repayment: totals.loan_repayment,
-        borrow_repayment: totals.borrow_repayment,
-        pending: totals.pending_payment,
-        overdue: totals.overdue_payment,
-        lost: totals.lost_payment,
-        net: totals.net,
-      },
-    });
-  } catch (error) {
-    console.error("❌ Complete performance error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to calculate performance",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 4. PERFORMANCE PIE CHART DATA
+// 4. PIE CHART
 // GET /api/performance/pie?month=2026-08
 //
-// Professional chart data:
-// Income
+// Exactly the five requested sections:
 // Expenses
-// Loan/EMI
-// Borrow repayment
-// Pending/Lost
+// Loans
+// Borrow
+// Received
+// Pending
 // ============================================================
 
 router.get("/pie", authenticate, async (req, res) => {
   try {
-    const month = req.query.month || getCurrentMonth();
+    const month = String(
+      req.query.month || getCurrentMonth()
+    );
+
     const range = getMonthRange(month);
 
     if (!range) {
@@ -1094,163 +909,227 @@ router.get("/pie", authenticate, async (req, res) => {
       });
     }
 
-    const [expense, payment, repayment] =
-      await Promise.all([
-        db.query(
-          `
-          SELECT COALESCE(SUM(amount),0) AS total
-          FROM personal_expenses
-          WHERE user_id = $1
-            AND expense_date >= $2::DATE
-            AND expense_date < $3::DATE
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
+    const [
+      expenseResult,
+      repaymentResult,
+      paymentResult,
+    ] = await Promise.all([
+      db.query(
+        `
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM personal_expenses
+        WHERE user_id = $1
+          AND expense_date >= $2::DATE
+          AND expense_date < $3::DATE
+        `,
+        [
+          req.userId,
+          range.monthStart,
+          range.nextMonthStart,
+        ]
+      ),
 
-        db.query(
-          `
-          SELECT
-            COALESCE(
-              SUM(amount) FILTER (WHERE status = 'Received'),
-              0
-            ) AS received,
-            COALESCE(
-              SUM(amount) FILTER (WHERE status = 'Pending'),
-              0
-            ) AS pending,
-            COALESCE(
-              SUM(amount) FILTER (WHERE status = 'Overdue'),
-              0
-            ) AS overdue,
-            COALESCE(
-              SUM(amount) FILTER (WHERE status = 'Lost'),
-              0
-            ) AS lost
-          FROM personal_payments
-          WHERE user_id = $1
-            AND payment_date >= $2::DATE
-            AND payment_date < $3::DATE
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
+      db.query(
+        `
+        SELECT
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type IN (
+                'EMI',
+                'Loan Repayment'
+              )
+            ),
+            0
+          ) AS loans,
 
-        db.query(
-          `
-          SELECT
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'EMI'
-              ),
-              0
-            ) AS loan_emi,
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE payment_type = 'Borrow Repayment'
+            ),
+            0
+          ) AS borrow
 
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'Loan Repayment'
-              ),
-              0
-            ) AS loan_repayment,
+        FROM personal_loan_emi_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        `,
+        [
+          req.userId,
+          range.monthStart,
+          range.nextMonthStart,
+        ]
+      ),
 
-            COALESCE(
-              SUM(amount) FILTER (
-                WHERE payment_type = 'Borrow Repayment'
-              ),
-              0
-            ) AS borrow_repayment
+      db.query(
+        `
+        SELECT
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Received'
+            ),
+            0
+          ) AS received,
 
-          FROM personal_loan_emi_payments
-          WHERE user_id = $1
-            AND payment_date >= $2::DATE
-            AND payment_date < $3::DATE
-          `,
-          [
-            req.userId,
-            range.monthStart,
-            range.nextMonthStart,
-          ]
-        ),
-      ]);
+          COALESCE(
+            SUM(amount) FILTER (
+              WHERE status = 'Pending'
+            ),
+            0
+          ) AS pending
 
-    const expenseTotal =
-      toNumber(expense.rows[0].total);
+        FROM personal_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::DATE
+          AND payment_date < $3::DATE
+        `,
+        [
+          req.userId,
+          range.monthStart,
+          range.nextMonthStart,
+        ]
+      ),
+    ]);
 
-    const received =
-      toNumber(payment.rows[0].received);
+    const values = {
+      expenses: toNumber(
+        expenseResult.rows[0]?.total
+      ),
+      loans: toNumber(
+        repaymentResult.rows[0]?.loans
+      ),
+      borrow: toNumber(
+        repaymentResult.rows[0]?.borrow
+      ),
+      received: toNumber(
+        paymentResult.rows[0]?.received
+      ),
+      pending: toNumber(
+        paymentResult.rows[0]?.pending
+      ),
+    };
 
-    const pending =
-      toNumber(payment.rows[0].pending);
+    const total =
+      values.expenses +
+      values.loans +
+      values.borrow +
+      values.received +
+      values.pending;
 
-    const overdue =
-      toNumber(payment.rows[0].overdue);
-
-    const lost =
-      toNumber(payment.rows[0].lost);
-
-    const loanEmi =
-      toNumber(repayment.rows[0].loan_emi);
-
-    const loanRepayment =
-      toNumber(repayment.rows[0].loan_repayment);
-
-    const borrowRepayment =
-      toNumber(repayment.rows[0].borrow_repayment);
+    const pie = [
+      {
+        label: "Expenses",
+        value: values.expenses,
+      },
+      {
+        label: "Loans",
+        value: values.loans,
+      },
+      {
+        label: "Borrow",
+        value: values.borrow,
+      },
+      {
+        label: "Received",
+        value: values.received,
+      },
+      {
+        label: "Pending",
+        value: values.pending,
+      },
+    ].map((item) => ({
+      ...item,
+      percentage:
+        total > 0
+          ? Number(
+              ((item.value / total) * 100).toFixed(2)
+            )
+          : 0,
+    }));
 
     return res.json({
       success: true,
-      month,
 
-      data: [
-        {
-          label: "Received Income",
-          value: received,
-        },
-        {
-          label: "Expenses",
-          value: expenseTotal,
-        },
-        {
-          label: "Loan / EMI",
-          value: loanEmi + loanRepayment,
-        },
-        {
-          label: "Borrow Repayment",
-          value: borrowRepayment,
-        },
-        {
-          label: "Pending",
-          value: pending,
-        },
-        {
-          label: "Overdue",
-          value: overdue,
-        },
-        {
-          label: "Lost",
-          value: lost,
-        },
-      ],
+      month,
+      month_name: monthName(month),
+
+      values,
+
+      total,
+
+      pie,
     });
   } catch (error) {
     console.error("❌ Performance pie error:", error);
 
     return res.status(500).json({
       success: false,
-      message: "Failed to calculate performance chart data",
-      error: error.message,
+      message: "Failed to calculate performance pie chart",
     });
   }
 });
 
 // ============================================================
-// EXPORT
+// 5. SELECTED MONTH SUMMARY CARDS
+// GET /api/performance/cards?month=2026-08
 // ============================================================
+
+router.get("/cards", authenticate, async (req, res) => {
+  try {
+    const month = String(
+      req.query.month || getCurrentMonth()
+    );
+
+    const data = await getSelectedMonthData(
+      req.userId,
+      month
+    );
+
+    const cards = [
+      {
+        key: "expenses",
+        label: "Expenses",
+        amount: data.totals.expenses,
+      },
+      {
+        key: "loans",
+        label: "Loans",
+        amount: data.totals.total_loans,
+      },
+      {
+        key: "borrow",
+        label: "Borrow",
+        amount: data.totals.borrow_repayment,
+      },
+      {
+        key: "received",
+        label: "Received",
+        amount: data.totals.received_payment,
+      },
+      {
+        key: "pending",
+        label: "Pending",
+        amount: data.totals.pending_payment,
+      },
+    ];
+
+    return res.json({
+      success: true,
+      month: data.month,
+      month_name: data.month_name,
+      cards,
+    });
+  } catch (error) {
+    console.error("❌ Performance cards error:", error);
+
+    return res.status(error.statusCode || 500).json({
+      success: false,
+      message:
+        error.statusCode === 400
+          ? error.message
+          : "Failed to calculate performance cards",
+    });
+  }
+});
 
 module.exports = router;

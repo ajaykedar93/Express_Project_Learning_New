@@ -1,2911 +1,2455 @@
-// routes/exportDetailsApi.js
-// Export Details API
-// Professional PDF + Excel + TXT exports
-//
-// Exports:
-// 1. Selected month complete summary
-// 2. Weekly performance
-// 3. Monthly performance
-// 4. Overview details
-//
-// PDF:
-// - Clean professional layout
-// - No clipped/hidden text
-// - Automatic page breaks
-// - Summary cards
-// - Pie-chart style visual sections
-// - Weekly/monthly tables
-//
-// Excel:
-// - Multiple professional worksheets
-// - Overview / Summary / Weekly / Monthly / Expenses / Payments / Loans
-// - Auto column widths
-// - Filters and frozen headers
-//
-// TXT:
-// - Clean readable plain-text report
-//
-// Required packages:
-// npm install pdfkit exceljs jsonwebtoken
-//
-// PostgreSQL + Express + JWT
+/*
+  exportDetailsapi.js
+  ------------------------------------------------------------
+  Professional export API for:
+    - Monthly / Weekly reports
+    - PDF (A4, no empty pages)
+    - Excel
+    - TXT
+    - JSON data
+
+  IMPORTANT:
+    Mount this router with:
+      app.use("/api/export-details", require("./routes/exportDetailsapi"));
+
+    The application should already have its normal authentication
+    middleware if it sets req.user.
+
+  Required packages:
+    npm install express pg pdfkit exceljs
+
+  Expected database tables:
+    personal_users
+    personal_business_work
+    personal_expenses
+    personal_loans_borrow
+    personal_loan_emi_payments
+    personal_payments
+    personal_overview
+*/
 
 const express = require("express");
-const jwt = require("jsonwebtoken");
 const PDFDocument = require("pdfkit");
 const ExcelJS = require("exceljs");
 
 const router = express.Router();
-const db = require("../db.js");
 
-const JWT_SECRET =
-  process.env.JWT_SECRET || "your-secret-key";
+// -----------------------------------------------------------------------------
+// DATABASE
+// -----------------------------------------------------------------------------
+// Use your existing pool. If your project exports pool differently,
+// replace this require with your existing db/pool file.
+const db = require("../db");
 
-// ============================================================
-// AUTHENTICATION
-// ============================================================
+// -----------------------------------------------------------------------------
+// AUTH
+// -----------------------------------------------------------------------------
+// This middleware accepts the user ID already supplied by your existing
+// login/authentication middleware.
+//
+// Supported req.user shapes:
+//   req.user.id
+//   req.user.userId
+//   req.user.user_id
+//
+// If your existing middleware uses another property, change only this block.
+function requireUser(req, res, next) {
+  const user = req.user || {};
 
-const authenticate = (req, res, next) => {
-  try {
-    const header = req.headers.authorization || "";
+  const userId =
+    user.id ??
+    user.userId ??
+    user.user_id ??
+    req.userId ??
+    req.authUserId;
 
-    if (!header.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token required",
-      });
-    }
-
-    const token = header.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    if (!decoded?.id) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authentication token",
-      });
-    }
-
-    req.userId = Number(decoded.id);
-    next();
-  } catch (error) {
+  if (!userId || !Number.isInteger(Number(userId))) {
     return res.status(401).json({
       success: false,
-      message: "Invalid or expired authentication token",
+      message: "User authentication required.",
     });
   }
-};
 
-// ============================================================
+  req.exportUserId = Number(userId);
+  next();
+}
+
+// -----------------------------------------------------------------------------
 // HELPERS
-// ============================================================
+// -----------------------------------------------------------------------------
 
-const getCurrentMonth = () => {
-  const now = new Date();
+function asNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : 0;
+}
 
-  return `${now.getFullYear()}-${String(
-    now.getMonth() + 1
-  ).padStart(2, "0")}`;
-};
+/*
+  Amount formatting:
+    2000       -> "2000"
+    2000.00    -> "2000"
+    2000.70    -> "2000.7"
+    2000.75    -> "2000.75"
 
-const getMonthRange = (month) => {
-  if (!/^\d{4}-\d{2}$/.test(month || "")) {
-    return null;
-  }
+  No automatic ".00".
+  No small "1" is added before/after amounts.
+*/
+function formatAmount(value) {
+  const n = asNumber(value);
 
-  const [year, monthNumber] =
-    month.split("-").map(Number);
+  if (Object.is(n, -0)) return "0";
 
-  if (
-    monthNumber < 1 ||
-    monthNumber > 12
-  ) {
-    return null;
-  }
+  const rounded = Math.round((n + Number.EPSILON) * 100) / 100;
 
-  const monthStart =
-    `${year}-${String(monthNumber).padStart(2, "0")}-01`;
-
-  const nextYear =
-    monthNumber === 12
-      ? year + 1
-      : year;
-
-  const nextMonth =
-    monthNumber === 12
-      ? 1
-      : monthNumber + 1;
-
-  const nextMonthStart =
-    `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
-
-  return {
-    monthStart,
-    nextMonthStart,
-  };
-};
-
-const toNumber = (value) =>
-  Number(value || 0);
-
-const money = (value) =>
-  `₹${toNumber(value).toLocaleString("en-IN", {
-    minimumFractionDigits: 2,
+  return new Intl.NumberFormat("en-IN", {
+    useGrouping: true,
     maximumFractionDigits: 2,
-  })}`;
+    minimumFractionDigits: 0,
+  }).format(rounded);
+}
 
-const safeText = (value) =>
-  value === null ||
-  value === undefined ||
-  value === ""
-    ? "-"
-    : String(value);
+function formatCurrency(value) {
+  return `₹${formatAmount(value)}`;
+}
 
-const statusFromTotals = (
-  income,
-  outgoing
-) => {
-  const net =
-    income - outgoing;
+function formatDate(value) {
+  if (!value) return "-";
 
-  if (
-    income === 0 &&
-    outgoing === 0
-  ) {
-    return "No Activity";
+  const raw = String(value).slice(0, 10);
+
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    return String(value);
   }
 
-  if (net > 0) return "Profit";
-  if (net < 0) return "Loss";
+  const [y, m, d] = raw.split("-");
+  return `${d} ${monthName(Number(m))} ${y}`;
+}
 
-  return "Break Even";
-};
+function formatDateTime(value) {
+  if (!value) return "-";
 
-// ============================================================
-// FETCH COMPLETE EXPORT DATA
-// ============================================================
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return String(value);
 
-const getExportData = async (
-  userId,
-  month
-) => {
-  const range =
-    getMonthRange(month);
-
-  if (!range) {
-    throw new Error(
-      "Invalid month. Use YYYY-MM."
-    );
-  }
-
-  // ----------------------------------------------------------
-  // User
-  // ----------------------------------------------------------
-
-  const userResult =
-    await db.query(
-      `
-      SELECT
-        id,
-        full_name,
-        profession,
-        instagram,
-        phone1,
-        phone2,
-        email1,
-        email2,
-        username,
-        email_address,
-        street,
-        city,
-        taluka,
-        district,
-        state,
-        pincode
-      FROM personal_users
-      WHERE id = $1
-      `,
-      [userId]
-    );
-
-  if (
-    userResult.rows.length === 0
-  ) {
-    throw new Error(
-      "User not found"
-    );
-  }
-
-  // ----------------------------------------------------------
-  // Overview
-  // ----------------------------------------------------------
-
-  const overviewResult =
-    await db.query(
-      `
-      SELECT
-        total_business,
-        total_works,
-        business_payment,
-        work_payment
-      FROM personal_overview
-      WHERE user_id = $1
-      ORDER BY id DESC
-      LIMIT 1
-      `,
-      [userId]
-    );
-
-  // ----------------------------------------------------------
-  // Payments
-  // ----------------------------------------------------------
-
-  const paymentsResult =
-    await db.query(
-      `
-      SELECT
-        id,
-        person_name,
-        amount,
-        category,
-        payment_date,
-        received_at,
-        status,
-        notes
-      FROM personal_payments
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-      ORDER BY payment_date ASC, id ASC
-      `,
-      [
-        userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-  // ----------------------------------------------------------
-  // Expenses
-  // ----------------------------------------------------------
-
-  const expensesResult =
-    await db.query(
-      `
-      SELECT
-        id,
-        category,
-        amount,
-        expense_date,
-        notes
-      FROM personal_expenses
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-      ORDER BY expense_date ASC, id ASC
-      `,
-      [
-        userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-  // ----------------------------------------------------------
-  // Loans / Borrow
-  // ----------------------------------------------------------
-
-  const loansResult =
-    await db.query(
-      `
-      SELECT
-        id,
-        name,
-        type,
-        amount,
-        emi,
-        start_date,
-        end_date,
-        return_date,
-        status,
-        notes
-      FROM personal_loans_borrow
-      WHERE user_id = $1
-      ORDER BY
-        CASE
-          WHEN type = 'Loan'
-            THEN end_date
-          ELSE return_date
-        END ASC NULLS LAST,
-        id ASC
-      `,
-      [userId]
-    );
-
-  // ----------------------------------------------------------
-  // Repayments
-  // ----------------------------------------------------------
-
-  const repaymentsResult =
-    await db.query(
-      `
-      SELECT
-        id,
-        loan_id,
-        amount,
-        payment_date,
-        payment_type,
-        notes
-      FROM personal_loan_emi_payments
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-      ORDER BY payment_date ASC, id ASC
-      `,
-      [
-        userId,
-        range.monthStart,
-        range.nextMonthStart,
-      ]
-    );
-
-  // ----------------------------------------------------------
-  // Weekly performance
-  // ----------------------------------------------------------
-
-  const weekly = [1, 2, 3, 4, 5].map(
-    (week) => ({
-      week,
-      income: 0,
-      expenses: 0,
-      loan_emi: 0,
-      loan_repayment: 0,
-      borrow_repayment: 0,
-      pending: 0,
-      overdue: 0,
-      lost: 0,
-      outgoing: 0,
-      net: 0,
-      status: "No Activity",
-    })
-  );
-
-  expensesResult.rows.forEach(
-    (row) => {
-      const day =
-        new Date(
-          `${row.expense_date}T00:00:00Z`
-        ).getUTCDate();
-
-      const week =
-        day <= 7
-          ? 1
-          : day <= 14
-            ? 2
-            : day <= 21
-              ? 3
-              : day <= 28
-                ? 4
-                : 5;
-
-      weekly[week - 1].expenses +=
-        toNumber(row.amount);
-    }
-  );
-
-  paymentsResult.rows.forEach(
-    (row) => {
-      const day =
-        new Date(
-          `${row.payment_date}T00:00:00Z`
-        ).getUTCDate();
-
-      const week =
-        day <= 7
-          ? 1
-          : day <= 14
-            ? 2
-            : day <= 21
-              ? 3
-              : day <= 28
-                ? 4
-                : 5;
-
-      if (row.status === "Received") {
-        weekly[week - 1].income +=
-          toNumber(row.amount);
-      }
-
-      if (row.status === "Pending") {
-        weekly[week - 1].pending +=
-          toNumber(row.amount);
-      }
-
-      if (row.status === "Overdue") {
-        weekly[week - 1].overdue +=
-          toNumber(row.amount);
-      }
-
-      if (row.status === "Lost") {
-        weekly[week - 1].lost +=
-          toNumber(row.amount);
-      }
-    }
-  );
-
-  repaymentsResult.rows.forEach(
-    (row) => {
-      const day =
-        new Date(
-          `${row.payment_date}T00:00:00Z`
-        ).getUTCDate();
-
-      const week =
-        day <= 7
-          ? 1
-          : day <= 14
-            ? 2
-            : day <= 21
-              ? 3
-              : day <= 28
-                ? 4
-                : 5;
-
-      const amount =
-        toNumber(row.amount);
-
-      if (
-        row.payment_type === "EMI"
-      ) {
-        weekly[week - 1].loan_emi +=
-          amount;
-      }
-
-      if (
-        row.payment_type ===
-        "Loan Repayment"
-      ) {
-        weekly[week - 1]
-          .loan_repayment += amount;
-      }
-
-      if (
-        row.payment_type ===
-        "Borrow Repayment"
-      ) {
-        weekly[week - 1]
-          .borrow_repayment += amount;
-      }
-    }
-  );
-
-  weekly.forEach((row) => {
-    row.outgoing =
-      row.expenses +
-      row.loan_emi +
-      row.loan_repayment +
-      row.borrow_repayment;
-
-    row.net =
-      row.income -
-      row.outgoing;
-
-    row.status =
-      statusFromTotals(
-        row.income,
-        row.outgoing
-      );
+  const date = d.toLocaleDateString("en-IN", {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
   });
 
-  // ----------------------------------------------------------
-  // Monthly totals
-  // ----------------------------------------------------------
+  const time = d.toLocaleTimeString("en-IN", {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
 
-  const totalIncome =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.income,
-      0
-    );
+  return `${date}, ${time}`;
+}
 
-  const totalExpenses =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.expenses,
-      0
-    );
+function monthName(month) {
+  return [
+    "",
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+  ][month] || "";
+}
 
-  const totalLoanEmi =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.loan_emi,
-      0
-    );
+function monthTitle(month) {
+  const match = /^(\d{4})-(\d{2})$/.exec(month);
+  if (!match) return month;
 
-  const totalLoanRepayment =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.loan_repayment,
-      0
-    );
+  const year = Number(match[1]);
+  const m = Number(match[2]);
 
-  const totalBorrowRepayment =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.borrow_repayment,
-      0
-    );
+  return new Date(year, m - 1, 1).toLocaleDateString("en-IN", {
+    month: "long",
+    year: "numeric",
+  });
+}
 
-  const totalPending =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.pending,
-      0
-    );
+function getCurrentMonth() {
+  const now = new Date();
 
-  const totalOverdue =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.overdue,
-      0
-    );
-
-  const totalLost =
-    weekly.reduce(
-      (sum, row) =>
-        sum + row.lost,
-      0
-    );
-
-  const totalOutgoing =
-    totalExpenses +
-    totalLoanEmi +
-    totalLoanRepayment +
-    totalBorrowRepayment;
-
-  const net =
-    totalIncome -
-    totalOutgoing;
-
-  // ----------------------------------------------------------
-  // Expense categories
-  // ----------------------------------------------------------
-
-  const categoryMap =
-    new Map();
-
-  expensesResult.rows.forEach(
-    (row) => {
-      const key =
-        safeText(row.category);
-
-      categoryMap.set(
-        key,
-        (categoryMap.get(key) || 0) +
-          toNumber(row.amount)
-      );
-    }
+  return (
+    String(now.getFullYear()) +
+    "-" +
+    String(now.getMonth() + 1).padStart(2, "0")
   );
+}
 
-  const expenseCategories =
-    Array.from(
-      categoryMap.entries()
-    )
-      .map(
-        ([category, total]) => ({
-          category,
-          total,
-        })
-      )
-      .sort(
-        (a, b) =>
-          b.total - a.total
-      );
+function validateMonth(month) {
+  return /^\d{4}-(0[1-9]|1[0-2])$/.test(month);
+}
 
-  // ----------------------------------------------------------
-  // Monthly chart data
-  // ----------------------------------------------------------
+function getMonthDates(month) {
+  const [year, monthNumber] = month.split("-").map(Number);
 
-  const chart = [
-    {
-      label: "Income",
-      value: totalIncome,
-    },
-    {
-      label: "Expenses",
-      value: totalExpenses,
-    },
-    {
-      label: "EMI / Loan",
-      value:
-        totalLoanEmi +
-        totalLoanRepayment,
-    },
-    {
-      label: "Borrow Repayment",
-      value:
-        totalBorrowRepayment,
-    },
-  ];
+  const start = `${year}-${String(monthNumber).padStart(2, "0")}-01`;
+
+  const nextMonthDate = new Date(year, monthNumber, 1);
+  const nextMonth = [
+    nextMonthDate.getFullYear(),
+    String(nextMonthDate.getMonth() + 1).padStart(2, "0"),
+    "01",
+  ].join("-");
 
   return {
-    user: userResult.rows[0],
-
-    overview:
-      overviewResult.rows[0] || {
-        total_business: 0,
-        total_works: 0,
-        business_payment: 0,
-        work_payment: 0,
-      },
-
-    month,
-
-    summary: {
-      total_income: totalIncome,
-      total_expenses: totalExpenses,
-      total_emi: totalLoanEmi,
-      total_loan_repayment:
-        totalLoanRepayment,
-      total_borrow_repayment:
-        totalBorrowRepayment,
-      total_outgoing: totalOutgoing,
-      net,
-      savings: Math.max(0, net),
-      loss: Math.max(0, -net),
-      pending: totalPending,
-      overdue: totalOverdue,
-      lost: totalLost,
-      status:
-        statusFromTotals(
-          totalIncome,
-          totalOutgoing
-        ),
-    },
-
-    chart,
-
-    expenseCategories,
-
-    weekly,
-
-    payments:
-      paymentsResult.rows.map(
-        (row) => ({
-          ...row,
-          amount:
-            toNumber(row.amount),
-        })
-      ),
-
-    expenses:
-      expensesResult.rows.map(
-        (row) => ({
-          ...row,
-          amount:
-            toNumber(row.amount),
-        })
-      ),
-
-    loans:
-      loansResult.rows.map(
-        (row) => ({
-          ...row,
-          amount:
-            toNumber(row.amount),
-          emi:
-            toNumber(row.emi),
-        })
-      ),
-
-    repayments:
-      repaymentsResult.rows.map(
-        (row) => ({
-          ...row,
-          amount:
-            toNumber(row.amount),
-        })
-      ),
+    start,
+    endExclusive: nextMonth,
+    lastDay: new Date(year, monthNumber, 0).getDate(),
   };
-};
+}
 
-// ============================================================
-// PDF HELPERS
-// ============================================================
+function getWeekDates(month, week) {
+  const { lastDay } = getMonthDates(month);
 
-const PDF_MARGIN = 42;
+  const weekNumber = Number(week);
 
-const drawPdfTitle = (
-  doc,
-  title,
-  subtitle
-) => {
-  doc
-    .fontSize(22)
-    .font("Helvetica-Bold")
-    .text(title, {
-      align: "left",
-    });
+  const ranges = [
+    [1, Math.min(7, lastDay)],
+    [8, Math.min(14, lastDay)],
+    [15, Math.min(21, lastDay)],
+    [22, lastDay],
+  ];
 
-  doc
-    .moveDown(0.3)
-    .fontSize(10)
-    .font("Helvetica")
-    .text(subtitle);
+  const [startDay, endDay] =
+    ranges[Math.max(1, Math.min(4, weekNumber)) - 1];
 
-  doc.moveDown(1);
-};
+  const start = `${month}-${String(startDay).padStart(2, "0")}`;
 
-const drawPdfSection = (
-  doc,
-  title
-) => {
-  // Prevent section title from being stranded
-  // at the bottom of a page.
-  if (
-    doc.y >
-    doc.page.height - 100
-  ) {
-    doc.addPage();
+  const endDate = new Date(
+    Number(month.slice(0, 4)),
+    Number(month.slice(5, 7)) - 1,
+    endDay
+  );
+
+  endDate.setDate(endDate.getDate() + 1);
+
+  const endExclusive =
+    `${endDate.getFullYear()}-` +
+    `${String(endDate.getMonth() + 1).padStart(2, "0")}-` +
+    `${String(endDate.getDate()).padStart(2, "0")}`;
+
+  return {
+    start,
+    endExclusive,
+    startDay,
+    endDay,
+  };
+}
+
+function getPeriod(req) {
+  const period = req.query.period === "week" ? "week" : "month";
+
+  const month = req.query.month || getCurrentMonth();
+
+  if (!validateMonth(month)) {
+    const error = new Error(
+      "Invalid month. Use YYYY-MM, for example 2026-08."
+    );
+    error.status = 400;
+    throw error;
   }
 
-  doc
-    .fontSize(14)
-    .font("Helvetica-Bold")
-    .text(title);
+  let week = null;
 
-  doc.moveDown(0.4);
+  if (period === "week") {
+    week = Number(req.query.week || 1);
+
+    if (![1, 2, 3, 4].includes(week)) {
+      const error = new Error("Week must be 1, 2, 3 or 4.");
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  const range =
+    period === "week"
+      ? getWeekDates(month, week)
+      : getMonthDates(month);
+
+  return {
+    period,
+    month,
+    week,
+    startDate: range.start,
+    endDateExclusive: range.endExclusive,
+    startDay: range.startDay || 1,
+    endDay: range.endDay || range.lastDay,
+  };
+}
+
+function safeText(value) {
+  if (value === null || value === undefined || value === "") {
+    return "-";
+  }
+
+  return String(value);
+}
+
+function hasRows(rows) {
+  return Array.isArray(rows) && rows.length > 0;
+}
+
+function addTotal(rows, field) {
+  return rows.reduce((sum, row) => sum + asNumber(row[field]), 0);
+}
+
+function normalizeRows(rows) {
+  return Array.isArray(rows) ? rows : [];
+}
+
+// -----------------------------------------------------------------------------
+// DATA LOADING
+// -----------------------------------------------------------------------------
+
+async function loadReportData(userId, periodInfo) {
+  const values = [
+    userId,
+    periodInfo.startDate,
+    periodInfo.endDateExclusive,
+  ];
+
+  /*
+    Every query uses the date range in PostgreSQL.
+
+    IMPORTANT:
+      No "updated_at" is selected from personal_expenses because the
+      table supplied for this project contains created_at but does NOT
+      contain updated_at.
+  */
+
+  const [
+    userResult,
+    businessWorkResult,
+    expenseResult,
+    loanBorrowResult,
+    emiResult,
+    paymentsResult,
+    overviewResult,
+  ] = await Promise.all([
+    db.query(
+      `
+        SELECT
+          id,
+          full_name,
+          profession,
+          instagram,
+          phone1,
+          phone2,
+          email1,
+          email2,
+          username,
+          email_address,
+          street,
+          city,
+          taluka,
+          district,
+          state,
+          pincode,
+          profile_image,
+          created_at,
+          updated_at
+        FROM personal_users
+        WHERE id = $1
+        LIMIT 1
+      `,
+      [userId]
+    ),
+
+    db.query(
+      `
+        SELECT
+          id,
+          user_id,
+          name,
+          type,
+          status,
+          amount,
+          start_date,
+          end_date,
+          notes,
+          created_at,
+          updated_at
+        FROM personal_business_work
+        WHERE user_id = $1
+          AND (
+            start_date < $3::date
+            AND (
+              end_date IS NULL
+              OR end_date >= $2::date
+            )
+          )
+        ORDER BY start_date DESC NULLS LAST, id DESC
+      `,
+      values
+    ),
+
+    db.query(
+      `
+        SELECT
+          id,
+          user_id,
+          category,
+          amount,
+          expense_date,
+          notes,
+          created_at
+        FROM personal_expenses
+        WHERE user_id = $1
+          AND expense_date >= $2::date
+          AND expense_date < $3::date
+        ORDER BY expense_date DESC, id DESC
+      `,
+      values
+    ),
+
+    db.query(
+      `
+        SELECT
+          id,
+          user_id,
+          name,
+          type,
+          amount,
+          emi,
+          start_date,
+          end_date,
+          return_date,
+          status,
+          notes,
+          created_at,
+          updated_at
+        FROM personal_loans_borrow
+        WHERE user_id = $1
+          AND (
+            start_date < $3::date
+            AND (
+              end_date IS NULL
+              OR end_date >= $2::date
+              OR return_date IS NULL
+            )
+          )
+        ORDER BY start_date DESC NULLS LAST, id DESC
+      `,
+      values
+    ),
+
+    db.query(
+      `
+        SELECT
+          p.id,
+          p.user_id,
+          p.loan_id,
+          p.amount,
+          p.payment_date,
+          p.payment_type,
+          p.notes,
+          p.created_at,
+          lb.name AS loan_name
+        FROM personal_loan_emi_payments p
+        LEFT JOIN personal_loans_borrow lb
+          ON lb.id = p.loan_id
+        WHERE p.user_id = $1
+          AND p.payment_date >= $2::date
+          AND p.payment_date < $3::date
+        ORDER BY p.payment_date DESC, p.id DESC
+      `,
+      values
+    ),
+
+    db.query(
+      `
+        SELECT
+          id,
+          user_id,
+          person_name,
+          amount,
+          category,
+          payment_date,
+          status,
+          received_at,
+          notes,
+          created_at,
+          updated_at
+        FROM personal_payments
+        WHERE user_id = $1
+          AND payment_date >= $2::date
+          AND payment_date < $3::date
+        ORDER BY payment_date DESC, id DESC
+      `,
+      values
+    ),
+
+    /*
+      personal_overview may not exist in an older installation.
+      The error is handled below so export does not fail merely because
+      the optional overview table is absent.
+    */
+    db
+      .query(
+        `
+          SELECT *
+          FROM personal_overview
+          WHERE user_id = $1
+            AND (
+              month_start IS NULL
+              OR (
+                month_start >= $2::date
+                AND month_start < $3::date
+              )
+            )
+          ORDER BY month_start DESC NULLS LAST
+        `,
+        values
+      )
+      .catch((error) => {
+        if (error && error.code === "42P01") {
+          return { rows: [] };
+        }
+
+        throw error;
+      }),
+  ]);
+
+  if (!userResult.rows[0]) {
+    const error = new Error("User profile not found.");
+    error.status = 404;
+    throw error;
+  }
+
+  const data = {
+    user: userResult.rows[0],
+    tables: {
+      personal_business_work: normalizeRows(businessWorkResult.rows),
+      personal_expenses: normalizeRows(expenseResult.rows),
+      personal_loans_borrow: normalizeRows(loanBorrowResult.rows),
+      personal_loan_emi_payments: normalizeRows(emiResult.rows),
+      personal_payments: normalizeRows(paymentsResult.rows),
+      personal_overview: normalizeRows(overviewResult.rows),
+    },
+  };
+
+  data.summary = calculateSummary(data.tables);
+
+  data.period = {
+    period: periodInfo.period,
+    month: periodInfo.month,
+    monthTitle: monthTitle(periodInfo.month),
+    week: periodInfo.week,
+    startDate: periodInfo.startDate,
+    endDateExclusive: periodInfo.endDateExclusive,
+    startDay: periodInfo.startDay,
+    endDay: periodInfo.endDay,
+  };
+
+  data.categoryTotals = calculateCategoryTotals(
+    data.tables.personal_expenses
+  );
+
+  return data;
+}
+
+// -----------------------------------------------------------------------------
+// SUMMARY
+// -----------------------------------------------------------------------------
+
+function calculateCategoryTotals(expenses) {
+  const map = new Map();
+
+  for (const row of expenses) {
+    const category =
+      safeText(row.category) === "-"
+        ? "Uncategorized"
+        : safeText(row.category);
+
+    map.set(
+      category,
+      asNumber(map.get(category)) + asNumber(row.amount)
+    );
+  }
+
+  return Array.from(map.entries())
+    .map(([category, amount]) => ({
+      category,
+      amount,
+    }))
+    .sort((a, b) => b.amount - a.amount);
+}
+
+function calculateSummary(tables) {
+  const expenses = tables.personal_expenses;
+  const payments = tables.personal_payments;
+  const repayments = tables.personal_loan_emi_payments;
+  const loans = tables.personal_loans_borrow;
+  const businessWork = tables.personal_business_work;
+
+  const expenseTotal = addTotal(expenses, "amount");
+
+  const received = payments
+    .filter(
+      (row) =>
+        String(row.status).toLowerCase() === "received"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const pending = payments
+    .filter(
+      (row) =>
+        String(row.status).toLowerCase() === "pending"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const overdue = payments
+    .filter(
+      (row) =>
+        String(row.status).toLowerCase() === "overdue"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const lost = payments
+    .filter(
+      (row) =>
+        String(row.status).toLowerCase() === "lost"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const emiTotal = repayments
+    .filter(
+      (row) =>
+        String(row.payment_type).toLowerCase() === "emi"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const borrowRepayment = repayments
+    .filter(
+      (row) =>
+        String(row.payment_type).toLowerCase() ===
+        "borrow repayment"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const loanRepayment = repayments
+    .filter(
+      (row) =>
+        String(row.payment_type).toLowerCase() ===
+        "loan repayment"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const outgoing =
+    expenseTotal +
+    emiTotal +
+    borrowRepayment +
+    loanRepayment;
+
+  const net = received - outgoing;
+
+  const businessTotal = businessWork
+    .filter(
+      (row) =>
+        String(row.type).toLowerCase() === "business"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const workTotal = businessWork
+    .filter(
+      (row) =>
+        String(row.type).toLowerCase() === "work"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const activeLoanTotal = loans
+    .filter(
+      (row) =>
+        String(row.type).toLowerCase() === "loan" &&
+        String(row.status).toLowerCase() === "active"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  const activeBorrowTotal = loans
+    .filter(
+      (row) =>
+        String(row.type).toLowerCase() === "borrow" &&
+        String(row.status).toLowerCase() === "active"
+    )
+    .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+  return {
+    income: received,
+    received,
+    expenses: expenseTotal,
+    expenseTotal,
+    emi: emiTotal,
+    emiTotal,
+    borrowRepayment,
+    loanRepayment,
+    outgoing,
+    net,
+    savings: Math.max(net, 0),
+    loss: Math.max(-net, 0),
+    pending,
+    overdue,
+    lost,
+    businessTotal,
+    workTotal,
+    activeLoanTotal,
+    activeBorrowTotal,
+  };
+}
+
+// -----------------------------------------------------------------------------
+// WEEKLY SUMMARY
+// -----------------------------------------------------------------------------
+
+function calculateWeeklySummary(fullData, month) {
+  const weeks = [];
+
+  for (let week = 1; week <= 4; week += 1) {
+    const range = getWeekDates(month, week);
+
+    const expenses = fullData.tables.personal_expenses.filter(
+      (row) => {
+        const value = String(row.expense_date).slice(0, 10);
+        return (
+          value >= range.start &&
+          value < range.endExclusive
+        );
+      }
+    );
+
+    const payments = fullData.tables.personal_payments.filter(
+      (row) => {
+        const value = String(row.payment_date).slice(0, 10);
+        return (
+          value >= range.start &&
+          value < range.endExclusive
+        );
+      }
+    );
+
+    const repayments =
+      fullData.tables.personal_loan_emi_payments.filter(
+        (row) => {
+          const value = String(row.payment_date).slice(0, 10);
+          return (
+            value >= range.start &&
+            value < range.endExclusive
+          );
+        }
+      );
+
+    const income = payments
+      .filter(
+        (row) =>
+          String(row.status).toLowerCase() === "received"
+      )
+      .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+    const expenseTotal = addTotal(expenses, "amount");
+
+    const emi = repayments
+      .filter(
+        (row) =>
+          String(row.payment_type).toLowerCase() === "emi"
+      )
+      .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+    const loanRepayment = repayments
+      .filter(
+        (row) =>
+          String(row.payment_type).toLowerCase() ===
+          "loan repayment"
+      )
+      .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+    const borrowRepayment = repayments
+      .filter(
+        (row) =>
+          String(row.payment_type).toLowerCase() ===
+          "borrow repayment"
+      )
+      .reduce((sum, row) => sum + asNumber(row.amount), 0);
+
+    const outgoing =
+      expenseTotal +
+      emi +
+      loanRepayment +
+      borrowRepayment;
+
+    const net = income - outgoing;
+
+    const hasActivity =
+      expenses.length > 0 ||
+      payments.length > 0 ||
+      repayments.length > 0;
+
+    weeks.push({
+      week,
+      startDay: range.startDay,
+      endDay: range.endDay,
+      income,
+      expenses: expenseTotal,
+      emi,
+      loanRepayment,
+      borrowRepayment,
+      outgoing,
+      net,
+      hasActivity,
+      status: !hasActivity
+        ? "No Activity"
+        : net >= 0
+          ? "Positive"
+          : "Negative",
+    });
+  }
+
+  return weeks;
+}
+
+// -----------------------------------------------------------------------------
+// JSON DATA ROUTE
+// -----------------------------------------------------------------------------
+
+router.get("/data", requireUser, async (req, res) => {
+  try {
+    const periodInfo = getPeriod(req);
+
+    const data = await loadReportData(
+      req.exportUserId,
+      periodInfo
+    );
+
+    if (periodInfo.period === "month") {
+      data.weekly = calculateWeeklySummary(
+        data,
+        periodInfo.month
+      );
+    } else {
+      const allMonthData = await loadReportData(
+        req.exportUserId,
+        {
+          period: "month",
+          month: periodInfo.month,
+          week: null,
+          ...getMonthDates(periodInfo.month),
+        }
+      );
+
+      data.weekly = calculateWeeklySummary(
+        allMonthData,
+        periodInfo.month
+      );
+
+      data.selectedWeek =
+        data.weekly.find(
+          (row) => row.week === periodInfo.week
+        ) || null;
+    }
+
+    return res.json({
+      success: true,
+      ...data,
+    });
+  } catch (error) {
+    console.error("GET export details data error:", error);
+
+    return res.status(error.status || 500).json({
+      success: false,
+      message:
+        error.message || "Failed to load export details.",
+    });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// PDF HELPERS
+// -----------------------------------------------------------------------------
+
+const PDF = {
+  black: "#111827",
+  dark: "#0f172a",
+  gray: "#475569",
+  lightGray: "#64748b",
+  border: "#d8dee8",
+  soft: "#f3f5f8",
+  white: "#ffffff",
+  accent: "#4f46e5",
 };
 
-const drawPdfLine = (
-  doc,
-  label,
-  value
-) => {
+function pdfSafeText(value) {
+  return safeText(value)
+    .replace(/\r/g, "")
+    .replace(/\t/g, " ");
+}
+
+function pdfText(doc, value, options = {}) {
+  doc
+    .fillColor(options.color || PDF.black)
+    .font(options.font || "Helvetica")
+    .fontSize(options.size || 9)
+    .text(pdfSafeText(value), {
+      width: options.width,
+      align: options.align || "left",
+      lineGap: options.lineGap || 1,
+      continued: false,
+    });
+}
+
+/*
+  Draw a clean section title.
+  No automatic numbering is used.
+*/
+function pdfSectionTitle(doc, title) {
+  ensurePdfSpace(doc, 40);
+
   const y = doc.y;
 
   doc
-    .fontSize(9)
+    .fillColor(PDF.dark)
     .font("Helvetica-Bold")
-    .text(
-      `${safeText(label)}:`,
-      PDF_MARGIN,
-      y,
-      {
-        width: 180,
-        continued: true,
-      }
-    );
+    .fontSize(12)
+    .text(title, 48, y, {
+      width: doc.page.width - 96,
+    });
 
   doc
+    .moveTo(48, y + 17)
+    .lineTo(doc.page.width - 48, y + 17)
+    .lineWidth(0.7)
+    .strokeColor(PDF.border)
+    .stroke();
+
+  doc.y = y + 25;
+}
+
+function ensurePdfSpace(doc, neededHeight) {
+  const bottom = doc.page.height - 48;
+
+  if (doc.y + neededHeight > bottom) {
+    doc.addPage({
+      size: "A4",
+      margin: 48,
+    });
+  }
+}
+
+/*
+  Page header/footer.
+
+  Footer page number is deliberately a small page number ONLY.
+  It is never attached to amount values.
+*/
+function drawPdfPageFrame(doc) {
+  const pageNumber = doc.bufferedPageRange().count;
+
+  doc
+    .save()
+    .fillColor("#64748b")
     .font("Helvetica")
+    .fontSize(7)
     .text(
-      ` ${safeText(value)}`,
+      `Page ${pageNumber}`,
+      48,
+      doc.page.height - 30,
       {
-        width:
-          doc.page.width -
-          PDF_MARGIN * 2 -
-          180,
+        width: doc.page.width - 96,
+        align: "right",
       }
+    )
+    .restore();
+}
+
+function createPdfDocument(data) {
+  const doc = new PDFDocument({
+    size: "A4",
+    margin: 48,
+    autoFirstPage: true,
+    bufferPages: true,
+    compress: true,
+  });
+
+  doc.on("pageAdded", () => {
+    // Only frame pages that actually exist.
+    // No blank pages are manually created.
+  });
+
+  drawPdfCover(doc, data);
+
+  addPdfSummary(doc, data);
+
+  if (hasRows(data.categoryTotals)) {
+    addPdfCategoryTable(doc, data.categoryTotals);
+  }
+
+  if (hasRows(data.tables.personal_business_work)) {
+    addPdfBusinessWork(doc, data.tables.personal_business_work);
+  }
+
+  if (hasRows(data.tables.personal_expenses)) {
+    addPdfExpenses(doc, data.tables.personal_expenses);
+  }
+
+  if (hasRows(data.tables.personal_loans_borrow)) {
+    addPdfLoansBorrow(doc, data.tables.personal_loans_borrow);
+  }
+
+  if (hasRows(data.tables.personal_loan_emi_payments)) {
+    addPdfRepayments(
+      doc,
+      data.tables.personal_loan_emi_payments
+    );
+  }
+
+  if (hasRows(data.tables.personal_payments)) {
+    addPdfPayments(doc, data.tables.personal_payments);
+  }
+
+  if (hasRows(data.tables.personal_overview)) {
+    addPdfOverview(doc, data.tables.personal_overview);
+  }
+
+  if (data.period.period === "month") {
+    const weekly = calculateWeeklySummary(
+      data,
+      data.period.month
     );
 
-  doc.moveDown(0.15);
-};
+    if (weekly.some((row) => row.hasActivity)) {
+      addPdfWeeklySummary(doc, weekly);
+    }
+  }
 
-const drawPdfSummary = (
-  doc,
-  data
-) => {
-  drawPdfSection(
+  addPdfFooterInfo(doc, data);
+
+  // Put page numbers on every page that was actually created.
+  const range = doc.bufferedPageRange();
+
+  for (
+    let pageIndex = range.start;
+    pageIndex < range.start + range.count;
+    pageIndex += 1
+  ) {
+    doc.switchToPage(pageIndex);
+    drawPdfPageFrame(doc);
+  }
+
+  return doc;
+}
+
+function drawPdfCover(doc, data) {
+  const width = doc.page.width - 96;
+
+  doc
+    .roundedRect(48, 48, width, 95, 12)
+    .fillColor(PDF.dark)
+    .fill();
+
+  pdfText(doc, "PERSONAL FINANCIAL REPORT", {
+    color: PDF.white,
+    size: 18,
+    width: width - 30,
+  });
+
+  doc.y = 83;
+
+  pdfText(
     doc,
-    "Monthly Financial Summary"
-  );
-
-  const rows = [
-    [
-      "Total Income",
-      money(
-        data.summary.total_income
-      ),
-    ],
-    [
-      "Total Expenses",
-      money(
-        data.summary.total_expenses
-      ),
-    ],
-    [
-      "EMI / Loan",
-      money(
-        data.summary.total_emi +
-        data.summary.total_loan_repayment
-      ),
-    ],
-    [
-      "Borrow Repayment",
-      money(
-        data.summary.total_borrow_repayment
-      ),
-    ],
-    [
-      "Total Outgoing",
-      money(
-        data.summary.total_outgoing
-      ),
-    ],
-    [
-      "Net",
-      money(data.summary.net),
-    ],
-    [
-      "Savings",
-      money(data.summary.savings),
-    ],
-    [
-      "Loss",
-      money(data.summary.loss),
-    ],
-    [
-      "Status",
-      data.summary.status,
-    ],
-  ];
-
-  rows.forEach(
-    ([label, value]) =>
-      drawPdfLine(
-        doc,
-        label,
-        value
-      )
-  );
-
-  doc.moveDown(0.5);
-
-  // Simple pie-chart-style proportional bars.
-  // This is intentionally rendered as vector PDF content
-  // so the export does not depend on external images.
-  drawPdfSection(
-    doc,
-    "Financial Distribution"
-  );
-
-  const chartTotal =
-    data.chart.reduce(
-      (sum, item) =>
-        sum + Number(item.value || 0),
-      0
-    );
-
-  data.chart.forEach(
-    (item) => {
-      const percentage =
-        chartTotal > 0
-          ? (
-              (item.value /
-                chartTotal) *
-              100
-            )
-          : 0;
-
-      doc
-        .fontSize(8)
-        .font("Helvetica-Bold")
-        .text(
-          `${item.label} — ${money(
-            item.value
-          )} (${percentage.toFixed(1)}%)`
-        );
-
-      const barWidth =
-        Math.min(
-          460,
-          Math.max(
-            2,
-            460 *
-              (percentage / 100)
-          )
-        );
-
-      const y = doc.y;
-
-      doc
-        .rect(
-          PDF_MARGIN,
-          y,
-          barWidth,
-          8
-        )
-        .fillOpacity(0.18)
-        .fill()
-        .fillOpacity(1);
-
-      doc.moveDown(0.5);
+    data.period.period === "week"
+      ? `Week ${data.period.week} • ${data.period.monthTitle}`
+      : data.period.monthTitle,
+    {
+      color: "#c7d2fe",
+      size: 11,
+      width: width - 30,
     }
   );
-};
 
-const drawPdfTable = (
-  doc,
-  title,
-  columns,
-  rows
-) => {
-  drawPdfSection(
+  doc.y = 157;
+
+  pdfText(doc, "Account", {
+    color: PDF.lightGray,
+    size: 7,
+  });
+
+  doc.y += 2;
+
+  pdfText(
     doc,
-    title
+    data.user.full_name || data.user.username || "User",
+    {
+      color: PDF.black,
+      size: 12,
+    }
   );
 
-  const pageWidth =
-    doc.page.width -
-    PDF_MARGIN * 2;
+  doc.y += 2;
 
-  const columnWidth =
-    pageWidth /
-    columns.length;
+  pdfText(
+    doc,
+    [
+      data.user.profession,
+      data.user.username
+        ? `@${data.user.username}`
+        : null,
+      data.user.email_address,
+    ]
+      .filter(Boolean)
+      .join(" • "),
+    {
+      color: PDF.gray,
+      size: 8,
+    }
+  );
 
-  const rowHeight = 24;
+  doc.y += 18;
 
-  const drawHeader = () => {
+  doc
+    .moveTo(48, doc.y)
+    .lineTo(doc.page.width - 48, doc.y)
+    .lineWidth(0.8)
+    .strokeColor(PDF.border)
+    .stroke();
+
+  doc.y += 17;
+}
+
+function addPdfSummary(doc, data) {
+  pdfSectionTitle(doc, "Financial Summary");
+
+  const summary = data.summary;
+
+  const cards = [
+    ["Received / Income", summary.received],
+    ["Expenses", summary.expenses],
+    ["EMI", summary.emi],
+    ["Loan Repayment", summary.loanRepayment],
+    ["Borrow Repayment", summary.borrowRepayment],
+    ["Total Outgoing", summary.outgoing],
+    ["Net Result", summary.net],
+    ["Pending", summary.pending],
+  ];
+
+  const left = 48;
+  const gap = 9;
+  const colWidth = (doc.page.width - 96 - gap) / 2;
+  const rowHeight = 40;
+
+  for (let i = 0; i < cards.length; i += 1) {
+    const col = i % 2;
+    const row = Math.floor(i / 2);
+
+    const x = left + col * (colWidth + gap);
+    const y = doc.y + row * (rowHeight + 7);
+
+    doc
+      .roundedRect(x, y, colWidth, rowHeight, 7)
+      .fillColor(PDF.soft)
+      .fill()
+      .lineWidth(0.5)
+      .strokeColor(PDF.border)
+      .stroke();
+
+    pdfText(doc, cards[i][0], {
+      color: PDF.gray,
+      size: 7,
+      width: colWidth - 16,
+    });
+
+    pdfText(doc, formatCurrency(cards[i][1]), {
+      color: PDF.black,
+      size: 11,
+      width: colWidth - 16,
+    });
+
+    // Explicitly no "1", "2", etc. before amount values.
+  }
+
+  doc.y += 4 * (rowHeight + 7) + 10;
+}
+
+function drawPdfTable(doc, columns, rows, options = {}) {
+  if (!rows.length) return;
+
+  const pageWidth = doc.page.width;
+  const tableWidth = pageWidth - 96;
+  const headerHeight = options.headerHeight || 22;
+  const rowPadding = 5;
+  const fontSize = options.fontSize || 7;
+
+  let widths;
+
+  if (options.widths) {
+    widths = options.widths;
+  } else {
+    widths = columns.map(
+      () => tableWidth / columns.length
+    );
+  }
+
+  const totalWidth = widths.reduce(
+    (sum, width) => sum + width,
+    0
+  );
+
+  if (Math.abs(totalWidth - tableWidth) > 1) {
+    widths = widths.map(
+      (width) => (width / totalWidth) * tableWidth
+    );
+  }
+
+  function drawHeader() {
     const y = doc.y;
 
     doc
-      .rect(
-        PDF_MARGIN,
-        y,
-        pageWidth,
-        rowHeight
-      )
-      .fillOpacity(0.08)
-      .fill()
-      .fillOpacity(1);
+      .rect(48, y, tableWidth, headerHeight)
+      .fillColor("#e9edf3")
+      .fill();
 
-    columns.forEach(
-      (column, index) => {
-        doc
-          .fontSize(7.5)
-          .font("Helvetica-Bold")
-          .text(
-            safeText(column),
-            PDF_MARGIN +
-              index *
-                columnWidth +
-              4,
-            y + 7,
-            {
-              width:
-                columnWidth - 8,
-              height: 14,
-              ellipsis: false,
-            }
-          );
-      }
+    let x = 48;
+
+    columns.forEach((column, index) => {
+      pdfText(doc, column.title, {
+        color: PDF.black,
+        size: 7,
+        width: widths[index] - 8,
+      });
+
+      x += widths[index];
+    });
+
+    doc.y = y + headerHeight;
+  }
+
+  function calculateRowHeight(row) {
+    let maxLines = 1;
+
+    row.forEach((value, index) => {
+      const width = Math.max(30, widths[index] - rowPadding * 2);
+      const text = pdfSafeText(value);
+
+      // Approximate line count for stable pagination.
+      const charsPerLine = Math.max(
+        10,
+        Math.floor(width / (fontSize * 0.52))
+      );
+
+      const lines = Math.max(
+        1,
+        Math.ceil(text.length / charsPerLine)
+      );
+
+      maxLines = Math.max(maxLines, Math.min(lines, 7));
+    });
+
+    return Math.max(
+      22,
+      maxLines * (fontSize + 2) + rowPadding * 2
     );
-
-    doc.y =
-      y + rowHeight;
-  };
+  }
 
   drawHeader();
 
-  rows.forEach(
-    (row, rowIndex) => {
-      if (
-        doc.y >
-        doc.page.height -
-          PDF_MARGIN -
-          rowHeight
-      ) {
-        doc.addPage();
-        drawHeader();
-      }
+  for (const row of rows) {
+    const rowHeight = calculateRowHeight(row);
 
-      const y = doc.y;
+    if (
+      doc.y + rowHeight >
+      doc.page.height - 50
+    ) {
+      doc.addPage({
+        size: "A4",
+        margin: 48,
+      });
 
-      if (rowIndex % 2 === 0) {
-        doc
-          .rect(
-            PDF_MARGIN,
-            y,
-            pageWidth,
-            rowHeight
-          )
-          .fillOpacity(0.025)
-          .fill()
-          .fillOpacity(1);
-      }
+      drawHeader();
+    }
 
-      columns.forEach(
-        (_, index) => {
-          const value =
-            row[index];
+    const y = doc.y;
 
-          doc
-            .fontSize(7.2)
-            .font("Helvetica")
-            .text(
-              safeText(value),
-              PDF_MARGIN +
-                index *
-                  columnWidth +
-                4,
-              y + 7,
-              {
-                width:
-                  columnWidth - 8,
-                height: 14,
-                ellipsis: false,
-              }
-            );
-        }
-      );
+    doc
+      .rect(48, y, tableWidth, rowHeight)
+      .fillColor(PDF.white)
+      .fill()
+      .lineWidth(0.35)
+      .strokeColor(PDF.border)
+      .stroke();
 
-      doc.y =
-        y + rowHeight;
+    let x = 48;
+
+    row.forEach((value, index) => {
+      pdfText(doc, value, {
+        color: PDF.black,
+        size: fontSize,
+        width: widths[index] - rowPadding * 2,
+        lineGap: 1,
+      });
+
+      // The text cursor is not used for positioning other cells.
+      // Every cell is positioned explicitly.
+      doc.x = x + rowPadding;
+      doc.y = y + rowPadding;
+
+      x += widths[index];
+    });
+
+    doc.y = y + rowHeight;
+  }
+
+  doc.y += 9;
+}
+
+function addPdfCategoryTable(doc, categories) {
+  pdfSectionTitle(doc, "Expense Categories");
+
+  const total = categories.reduce(
+    (sum, row) => sum + asNumber(row.amount),
+    0
+  );
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Category" },
+      { title: "Amount" },
+      { title: "Share" },
+    ],
+    categories.map((row) => [
+      safeText(row.category),
+      formatCurrency(row.amount),
+      total > 0
+        ? `${((asNumber(row.amount) / total) * 100).toFixed(1)}%`
+        : "0%",
+    ]),
+    {
+      widths: [270, 160, 70],
+    }
+  );
+}
+
+function addPdfBusinessWork(doc, rows) {
+  pdfSectionTitle(doc, "Business / Work");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Type" },
+      { title: "Name" },
+      { title: "Amount" },
+      { title: "Status" },
+      { title: "Start" },
+      { title: "End" },
+    ],
+    rows.map((row) => [
+      safeText(row.type),
+      safeText(row.name),
+      formatCurrency(row.amount),
+      safeText(row.status),
+      formatDate(row.start_date),
+      formatDate(row.end_date),
+    ]),
+    {
+      widths: [68, 145, 80, 75, 75, 75],
+    }
+  );
+}
+
+function addPdfExpenses(doc, rows) {
+  pdfSectionTitle(doc, "Expenses");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Category" },
+      { title: "Amount" },
+      { title: "Date" },
+      { title: "Notes" },
+    ],
+    rows.map((row) => [
+      safeText(row.category),
+      formatCurrency(row.amount),
+      formatDate(row.expense_date),
+      safeText(row.notes),
+    ]),
+    {
+      widths: [135, 90, 85, 208],
+    }
+  );
+}
+
+function addPdfLoansBorrow(doc, rows) {
+  pdfSectionTitle(doc, "Loans / Borrow");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Type" },
+      { title: "Name" },
+      { title: "Amount" },
+      { title: "EMI" },
+      { title: "Status" },
+      { title: "Start" },
+      { title: "End / Return" },
+    ],
+    rows.map((row) => [
+      safeText(row.type),
+      safeText(row.name),
+      formatCurrency(row.amount),
+      formatCurrency(row.emi),
+      safeText(row.status),
+      formatDate(row.start_date),
+      formatDate(row.return_date || row.end_date),
+    ]),
+    {
+      widths: [62, 115, 75, 70, 72, 80, 89],
+    }
+  );
+}
+
+function addPdfRepayments(doc, rows) {
+  pdfSectionTitle(doc, "Loan / EMI Payments");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Loan" },
+      { title: "Payment Type" },
+      { title: "Amount" },
+      { title: "Date" },
+      { title: "Notes" },
+    ],
+    rows.map((row) => [
+      safeText(row.loan_name),
+      safeText(row.payment_type),
+      formatCurrency(row.amount),
+      formatDate(row.payment_date),
+      safeText(row.notes),
+    ]),
+    {
+      widths: [120, 125, 85, 85, 153],
+    }
+  );
+}
+
+function addPdfPayments(doc, rows) {
+  pdfSectionTitle(doc, "Payments");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Person" },
+      { title: "Category" },
+      { title: "Amount" },
+      { title: "Date" },
+      { title: "Status" },
+      { title: "Notes" },
+    ],
+    rows.map((row) => [
+      safeText(row.person_name),
+      safeText(row.category),
+      formatCurrency(row.amount),
+      formatDate(row.payment_date),
+      safeText(row.status),
+      safeText(row.notes),
+    ]),
+    {
+      widths: [100, 72, 80, 80, 72, 164],
+    }
+  );
+}
+
+function addPdfOverview(doc, rows) {
+  pdfSectionTitle(doc, "Monthly Overview");
+
+  const keys = Object.keys(rows[0] || {});
+
+  const importantKeys = keys.filter(
+    (key) =>
+      ![
+        "id",
+        "user_id",
+        "created_at",
+        "updated_at",
+      ].includes(key)
+  );
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Field" },
+      { title: "Value" },
+    ],
+    rows.flatMap((row) =>
+      importantKeys.map((key) => [
+        key.replace(/_/g, " "),
+        safeText(row[key]),
+      ])
+    ),
+    {
+      widths: [190, 340],
+    }
+  );
+}
+
+function addPdfWeeklySummary(doc, weekly) {
+  pdfSectionTitle(doc, "Weekly Performance");
+
+  drawPdfTable(
+    doc,
+    [
+      { title: "Week" },
+      { title: "Period" },
+      { title: "Income" },
+      { title: "Expenses" },
+      { title: "EMI" },
+      { title: "Loan" },
+      { title: "Borrow" },
+      { title: "Outgoing" },
+      { title: "Net" },
+      { title: "Status" },
+    ],
+    weekly
+      .filter((row) => row.hasActivity)
+      .map((row) => [
+        `Week ${row.week}`,
+        `${row.startDay}–${row.endDay}`,
+        formatCurrency(row.income),
+        formatCurrency(row.expenses),
+        formatCurrency(row.emi),
+        formatCurrency(row.loanRepayment),
+        formatCurrency(row.borrowRepayment),
+        formatCurrency(row.outgoing),
+        formatCurrency(row.net),
+        row.status,
+      ]),
+    {
+      widths: [45, 58, 65, 65, 55, 62, 62, 65, 65, 53],
+      fontSize: 6.4,
+    }
+  );
+}
+
+function addPdfFooterInfo(doc, data) {
+  ensurePdfSpace(doc, 35);
+
+  doc
+    .moveTo(48, doc.y)
+    .lineTo(doc.page.width - 48, doc.y)
+    .lineWidth(0.5)
+    .strokeColor(PDF.border)
+    .stroke();
+
+  doc.y += 8;
+
+  pdfText(
+    doc,
+    `Generated for ${safeText(
+      data.user.full_name || data.user.username
+    )}`,
+    {
+      color: PDF.gray,
+      size: 7,
     }
   );
 
-  doc.moveDown(0.8);
-};
+  pdfText(doc, `Generated on ${formatDateTime(new Date())}`, {
+    color: PDF.lightGray,
+    size: 7,
+  });
 
-// ============================================================
-// BUILD PDF
-// ============================================================
+  doc.y += 3;
+}
 
-const buildPdf = (
-  data,
-  res,
-  filename
-) => {
-  const doc =
-    new PDFDocument({
-      size: "A4",
-      margins: {
-        top: PDF_MARGIN,
-        bottom: PDF_MARGIN,
-        left: PDF_MARGIN,
-        right: PDF_MARGIN,
-      },
-      bufferPages: true,
-      info: {
-        Title:
-          `Personal Financial Report - ${data.month}`,
-        Author:
-          safeText(
-            data.user.full_name
-          ),
-        Subject:
-          "Personal Dashboard Export",
-      },
-    });
+// -----------------------------------------------------------------------------
+// PDF RESPONSE
+// -----------------------------------------------------------------------------
 
-  res.setHeader(
-    "Content-Type",
-    "application/pdf"
-  );
+function sendPdf(res, data) {
+  const filename =
+    `Personal_Financial_${data.period.period}_` +
+    `${data.period.month}` +
+    (data.period.week
+      ? `_Week_${data.period.week}`
+      : "") +
+    ".pdf";
 
+  const doc = createPdfDocument(data);
+
+  res.status(200);
+  res.setHeader("Content-Type", "application/pdf");
   res.setHeader(
     "Content-Disposition",
     `attachment; filename="${filename}"`
   );
+  res.setHeader("Cache-Control", "no-store");
 
   doc.pipe(res);
-
-  // ----------------------------------------------------------
-  // Header
-  // ----------------------------------------------------------
-
-  drawPdfTitle(
-    doc,
-    "Personal Financial Report",
-    `${safeText(
-      data.user.full_name
-    )} • ${data.month}`
-  );
-
-  drawPdfLine(
-    doc,
-    "Profession",
-    data.user.profession
-  );
-
-  drawPdfLine(
-    doc,
-    "Email",
-    data.user.email_address
-  );
-
-  drawPdfLine(
-    doc,
-    "Phone",
-    data.user.phone1
-  );
-
-  drawPdfLine(
-    doc,
-    "Location",
-    [
-      data.user.city,
-      data.user.taluka,
-      data.user.district,
-      data.user.state,
-      data.user.pincode,
-    ]
-      .filter(Boolean)
-      .join(", ")
-  );
-
-  doc.moveDown(0.5);
-
-  drawPdfSummary(
-    doc,
-    data
-  );
-
-  // ----------------------------------------------------------
-  // Overview
-  // ----------------------------------------------------------
-
-  drawPdfSection(
-    doc,
-    "Overview"
-  );
-
-  drawPdfLine(
-    doc,
-    "Total Business",
-    data.overview.total_business
-  );
-
-  drawPdfLine(
-    doc,
-    "Total Works",
-    data.overview.total_works
-  );
-
-  drawPdfLine(
-    doc,
-    "Business Payment",
-    money(
-      data.overview.business_payment
-    )
-  );
-
-  drawPdfLine(
-    doc,
-    "Work Payment",
-    money(
-      data.overview.work_payment
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Expense categories
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Expense Categories",
-    [
-      "Category",
-      "Total",
-    ],
-    data.expenseCategories.map(
-      (row) => [
-        row.category,
-        money(row.total),
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Weekly performance
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Weekly Performance",
-    [
-      "Week",
-      "Income",
-      "Expenses",
-      "Loan/EMI",
-      "Borrow",
-      "Outgoing",
-      "Net",
-      "Status",
-    ],
-    data.weekly.map(
-      (row) => [
-        `Week ${row.week}`,
-        money(row.income),
-        money(row.expenses),
-        money(
-          row.loan_emi +
-          row.loan_repayment
-        ),
-        money(
-          row.borrow_repayment
-        ),
-        money(row.outgoing),
-        money(row.net),
-        row.status,
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Payments
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Payments",
-    [
-      "Person",
-      "Category",
-      "Amount",
-      "Payment Date",
-      "Received",
-      "Status",
-    ],
-    data.payments.map(
-      (row) => [
-        row.person_name,
-        row.category,
-        money(row.amount),
-        row.payment_date,
-        row.received_at
-          ? String(
-              row.received_at
-            ).slice(0, 10)
-          : "-",
-        row.status,
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Expenses
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Expenses",
-    [
-      "Category",
-      "Amount",
-      "Date",
-      "Notes",
-    ],
-    data.expenses.map(
-      (row) => [
-        row.category,
-        money(row.amount),
-        row.expense_date,
-        row.notes || "-",
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Loans / Borrow
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Loans & Borrow",
-    [
-      "Name",
-      "Type",
-      "Amount",
-      "EMI",
-      "Start",
-      "Due",
-      "Status",
-    ],
-    data.loans.map(
-      (row) => [
-        row.name,
-        row.type,
-        money(row.amount),
-        money(row.emi),
-        row.start_date,
-        row.type === "Loan"
-          ? row.end_date
-          : row.return_date,
-        row.status,
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Repayments
-  // ----------------------------------------------------------
-
-  drawPdfTable(
-    doc,
-    "Loan / Borrow Repayments",
-    [
-      "Loan ID",
-      "Amount",
-      "Date",
-      "Type",
-      "Notes",
-    ],
-    data.repayments.map(
-      (row) => [
-        row.loan_id,
-        money(row.amount),
-        row.payment_date,
-        row.payment_type,
-        row.notes || "-",
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Footer on every page
-  // ----------------------------------------------------------
-
-  const range =
-    doc.bufferedPageRange();
-
-  for (
-    let index = range.start;
-    index <
-    range.start + range.count;
-    index++
-  ) {
-    doc.switchToPage(index);
-
-    const footerY =
-      doc.page.height -
-      25;
-
-    doc
-      .fontSize(7)
-      .font("Helvetica")
-      .text(
-        `© ${new Date().getFullYear()} Personal Dashboard • Page ${index + 1} of ${range.count}`,
-        PDF_MARGIN,
-        footerY,
-        {
-          width:
-            doc.page.width -
-            PDF_MARGIN * 2,
-          align: "center",
-        }
-      );
-  }
-
   doc.end();
-};
+}
 
-// ============================================================
-// EXCEL HELPERS
-// ============================================================
+// -----------------------------------------------------------------------------
+// EXCEL
+// -----------------------------------------------------------------------------
 
-const styleWorksheet = (
-  worksheet
-) => {
-  worksheet.views = [
-    {
-      state: "frozen",
-      ySplit: 1,
+function styleExcelSheet(sheet) {
+  sheet.views = [{ state: "frozen", ySplit: 1 }];
+
+  sheet.getRow(1).font = {
+    bold: true,
+    color: { argb: "FF111827" },
+  };
+
+  sheet.getRow(1).fill = {
+    type: "pattern",
+    pattern: "solid",
+    fgColor: { argb: "FFE9EDF3" },
+  };
+
+  sheet.getRow(1).border = {
+    bottom: {
+      style: "thin",
+      color: { argb: "FFD8DEE8" },
     },
+  };
+
+  sheet.autoFilter = {
+    from: 1,
+    to: Math.max(1, sheet.columnCount),
+    row: 1,
+  };
+}
+
+function addExcelSheet(workbook, name, columns, rows) {
+  if (!rows.length) return;
+
+  const sheet = workbook.addWorksheet(name);
+
+  sheet.columns = columns.map((column) => ({
+    header: column.header,
+    key: column.key,
+    width: column.width || 18,
+  }));
+
+  rows.forEach((row) => {
+    const output = {};
+
+    columns.forEach((column) => {
+      output[column.key] =
+        column.transform
+          ? column.transform(row)
+          : row[column.key];
+    });
+
+    sheet.addRow(output);
+  });
+
+  sheet.eachRow((row, rowNumber) => {
+    row.alignment = {
+      vertical: "top",
+      wrapText: true,
+    };
+
+    if (rowNumber > 1) {
+      row.eachCell((cell) => {
+        cell.font = {
+          color: { argb: "FF111827" },
+          size: 10,
+        };
+      });
+    }
+  });
+
+  styleExcelSheet(sheet);
+}
+
+async function createExcelWorkbook(data) {
+  const workbook = new ExcelJS.Workbook();
+
+  workbook.creator = "Personal Dashboard";
+  workbook.created = new Date();
+  workbook.modified = new Date();
+  workbook.properties.subject =
+    "Personal financial report";
+  workbook.properties.title =
+    `Personal Financial ${data.period.monthTitle}`;
+
+  const summarySheet =
+    workbook.addWorksheet("Summary");
+
+  summarySheet.columns = [
+    { header: "Metric", key: "metric", width: 28 },
+    { header: "Amount", key: "amount", width: 20 },
   ];
 
-  worksheet.autoFilter = {
-    from: "A1",
-    to: worksheet.getCell(
-      1,
-      Math.max(
-        1,
-        worksheet.columnCount
-      )
-    ).address,
-  };
+  const summary = data.summary;
 
-  worksheet.eachRow(
-    (row, rowNumber) => {
-      row.eachCell(
-        (cell) => {
-          cell.alignment = {
-            vertical: "middle",
-            wrapText: true,
-          };
-
-          if (
-            rowNumber === 1
-          ) {
-            cell.font = {
-              bold: true,
-              size: 11,
-            };
-          }
-        }
-      );
-
-      row.height =
-        rowNumber === 1
-          ? 24
-          : 20;
-    }
-  );
-
-  worksheet.columns.forEach(
-    (column) => {
-      let maxLength = 10;
-
-      column.eachCell(
-        {
-          includeEmpty: false,
-        },
-        (cell) => {
-          const length =
-            String(
-              cell.value ?? ""
-            ).length;
-
-          maxLength =
-            Math.max(
-              maxLength,
-              Math.min(
-                length + 2,
-                45
-              )
-            );
-        }
-      );
-
-      column.width =
-        Math.min(
-          Math.max(
-            maxLength,
-            12
-          ),
-          45
-        );
-    }
-  );
-};
-
-const addWorksheet = (
-  workbook,
-  name,
-  headers,
-  rows
-) => {
-  const worksheet =
-    workbook.addWorksheet(
-      name
-    );
-
-  worksheet.addRow(
-    headers
-  );
-
-  rows.forEach(
-    (row) =>
-      worksheet.addRow(
-        row
-      )
-  );
-
-  styleWorksheet(
-    worksheet
-  );
-
-  return worksheet;
-};
-
-// ============================================================
-// BUILD EXCEL
-// ============================================================
-
-const buildExcel = async (
-  data,
-  res,
-  filename
-) => {
-  const workbook =
-    new ExcelJS.Workbook();
-
-  workbook.creator =
-    "Personal Dashboard";
-
-  workbook.created =
-    new Date();
-
-  workbook.modified =
-    new Date();
-
-  workbook.properties = {
-    title:
-      `Personal Financial Report - ${data.month}`,
-    subject:
-      "Personal Dashboard Export",
-    company:
-      "Personal Dashboard",
-  };
-
-  // ----------------------------------------------------------
-  // Summary
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Summary",
+  [
+    ["Period", data.period.monthTitle],
     [
-      "Metric",
-      "Value",
+      "Report",
+      data.period.period === "week"
+        ? `Week ${data.period.week}`
+        : "Monthly",
     ],
+    ["Received / Income", formatCurrency(summary.received)],
+    ["Expenses", formatCurrency(summary.expenses)],
+    ["EMI", formatCurrency(summary.emi)],
     [
-      [
-        "Month",
-        data.month,
-      ],
-      [
-        "Total Income",
-        data.summary.total_income,
-      ],
-      [
-        "Total Expenses",
-        data.summary.total_expenses,
-      ],
-      [
-        "EMI",
-        data.summary.total_emi,
-      ],
-      [
-        "Loan Repayment",
-        data.summary.total_loan_repayment,
-      ],
-      [
-        "Borrow Repayment",
-        data.summary.total_borrow_repayment,
-      ],
-      [
-        "Total Outgoing",
-        data.summary.total_outgoing,
-      ],
-      [
-        "Net",
-        data.summary.net,
-      ],
-      [
-        "Savings",
-        data.summary.savings,
-      ],
-      [
-        "Loss",
-        data.summary.loss,
-      ],
-      [
-        "Pending",
-        data.summary.pending,
-      ],
-      [
-        "Overdue",
-        data.summary.overdue,
-      ],
-      [
-        "Lost",
-        data.summary.lost,
-      ],
-      [
-        "Status",
-        data.summary.status,
-      ],
-    ]
-  );
-
-  // ----------------------------------------------------------
-  // Pie chart data
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Chart Data",
-    [
-      "Category",
-      "Amount",
-    ],
-    data.chart.map(
-      (row) => [
-        row.label,
-        row.value,
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Overview
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Overview",
-    [
-      "Metric",
-      "Value",
-    ],
-    [
-      [
-        "Total Business",
-        data.overview.total_business,
-      ],
-      [
-        "Total Works",
-        data.overview.total_works,
-      ],
-      [
-        "Business Payment",
-        toNumber(
-          data.overview.business_payment
-        ),
-      ],
-      [
-        "Work Payment",
-        toNumber(
-          data.overview.work_payment
-        ),
-      ],
-    ]
-  );
-
-  // ----------------------------------------------------------
-  // Weekly
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Weekly Performance",
-    [
-      "Week",
-      "Income",
-      "Expenses",
-      "Loan EMI",
       "Loan Repayment",
-      "Borrow Repayment",
-      "Pending",
-      "Overdue",
-      "Lost",
-      "Outgoing",
-      "Net",
-      "Status",
+      formatCurrency(summary.loanRepayment),
     ],
-    data.weekly.map(
-      (row) => [
-        `Week ${row.week}`,
-        row.income,
-        row.expenses,
-        row.loan_emi,
-        row.loan_repayment,
-        row.borrow_repayment,
-        row.pending,
-        row.overdue,
-        row.lost,
-        row.outgoing,
-        row.net,
-        row.status,
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Expense categories
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Expense Categories",
     [
-      "Category",
-      "Total",
+      "Borrow Repayment",
+      formatCurrency(summary.borrowRepayment),
     ],
-    data.expenseCategories.map(
-      (row) => [
-        row.category,
-        row.total,
-      ]
-    )
+    ["Total Outgoing", formatCurrency(summary.outgoing)],
+    ["Net Result", formatCurrency(summary.net)],
+    ["Pending", formatCurrency(summary.pending)],
+    ["Overdue", formatCurrency(summary.overdue)],
+    ["Lost", formatCurrency(summary.lost)],
+    [
+      "Active Loan",
+      formatCurrency(summary.activeLoanTotal),
+    ],
+    [
+      "Active Borrow",
+      formatCurrency(summary.activeBorrowTotal),
+    ],
+    [
+      "Business Total",
+      formatCurrency(summary.businessTotal),
+    ],
+    ["Work Total", formatCurrency(summary.workTotal)],
+  ].forEach(([metric, amount]) => {
+    summarySheet.addRow({ metric, amount });
+  });
+
+  styleExcelSheet(summarySheet);
+
+  addExcelSheet(
+    workbook,
+    "Business Work",
+    [
+      { header: "ID", key: "id", width: 10 },
+      { header: "Name", key: "name", width: 28 },
+      { header: "Type", key: "type", width: 14 },
+      { header: "Status", key: "status", width: 14 },
+      {
+        header: "Amount",
+        key: "amount",
+        width: 18,
+        transform: (row) => formatAmount(row.amount),
+      },
+      {
+        header: "Start Date",
+        key: "start_date",
+        width: 16,
+        transform: (row) => formatDate(row.start_date),
+      },
+      {
+        header: "End Date",
+        key: "end_date",
+        width: 16,
+        transform: (row) => formatDate(row.end_date),
+      },
+      { header: "Notes", key: "notes", width: 40 },
+    ],
+    data.tables.personal_business_work
   );
 
-  // ----------------------------------------------------------
-  // Expenses
-  // ----------------------------------------------------------
-
-  addWorksheet(
+  addExcelSheet(
     workbook,
     "Expenses",
     [
-      "ID",
-      "Category",
-      "Amount",
-      "Date",
-      "Notes",
+      { header: "ID", key: "id", width: 10 },
+      { header: "Category", key: "category", width: 25 },
+      {
+        header: "Amount",
+        key: "amount",
+        width: 18,
+        transform: (row) => formatAmount(row.amount),
+      },
+      {
+        header: "Expense Date",
+        key: "expense_date",
+        width: 18,
+        transform: (row) => formatDate(row.expense_date),
+      },
+      { header: "Notes", key: "notes", width: 45 },
+      {
+        header: "Created At",
+        key: "created_at",
+        width: 22,
+        transform: (row) => formatDateTime(row.created_at),
+      },
     ],
-    data.expenses.map(
-      (row) => [
-        row.id,
-        row.category,
-        row.amount,
-        row.expense_date,
-        row.notes || "",
-      ]
-    )
+    data.tables.personal_expenses
   );
 
-  // ----------------------------------------------------------
-  // Payments
-  // ----------------------------------------------------------
-
-  addWorksheet(
-    workbook,
-    "Payments",
-    [
-      "ID",
-      "Person",
-      "Amount",
-      "Category",
-      "Payment Date",
-      "Received At",
-      "Status",
-      "Notes",
-    ],
-    data.payments.map(
-      (row) => [
-        row.id,
-        row.person_name,
-        row.amount,
-        row.category,
-        row.payment_date,
-        row.received_at
-          ? String(
-              row.received_at
-            ).slice(0, 19)
-          : "",
-        row.status,
-        row.notes || "",
-      ]
-    )
-  );
-
-  // ----------------------------------------------------------
-  // Loans / Borrow
-  // ----------------------------------------------------------
-
-  addWorksheet(
+  addExcelSheet(
     workbook,
     "Loans Borrow",
     [
-      "ID",
-      "Name",
-      "Type",
-      "Amount",
-      "EMI",
-      "Start Date",
-      "End Date",
-      "Return Date",
-      "Status",
-      "Notes",
+      { header: "ID", key: "id", width: 10 },
+      { header: "Name", key: "name", width: 25 },
+      { header: "Type", key: "type", width: 14 },
+      {
+        header: "Amount",
+        key: "amount",
+        width: 18,
+        transform: (row) => formatAmount(row.amount),
+      },
+      {
+        header: "EMI",
+        key: "emi",
+        width: 18,
+        transform: (row) => formatAmount(row.emi),
+      },
+      {
+        header: "Start Date",
+        key: "start_date",
+        width: 18,
+        transform: (row) => formatDate(row.start_date),
+      },
+      {
+        header: "End Date",
+        key: "end_date",
+        width: 18,
+        transform: (row) => formatDate(row.end_date),
+      },
+      {
+        header: "Return Date",
+        key: "return_date",
+        width: 18,
+        transform: (row) => formatDate(row.return_date),
+      },
+      { header: "Status", key: "status", width: 15 },
+      { header: "Notes", key: "notes", width: 40 },
     ],
-    data.loans.map(
-      (row) => [
-        row.id,
-        row.name,
-        row.type,
-        row.amount,
-        row.emi,
-        row.start_date,
-        row.end_date || "",
-        row.return_date || "",
-        row.status,
-        row.notes || "",
-      ]
-    )
+    data.tables.personal_loans_borrow
   );
 
-  // ----------------------------------------------------------
-  // Repayments
-  // ----------------------------------------------------------
-
-  addWorksheet(
+  addExcelSheet(
     workbook,
     "Repayments",
     [
-      "ID",
-      "Loan ID",
-      "Amount",
-      "Payment Date",
-      "Payment Type",
-      "Notes",
+      { header: "ID", key: "id", width: 10 },
+      { header: "Loan ID", key: "loan_id", width: 12 },
+      { header: "Loan", key: "loan_name", width: 25 },
+      { header: "Payment Type", key: "payment_type", width: 24 },
+      {
+        header: "Amount",
+        key: "amount",
+        width: 18,
+        transform: (row) => formatAmount(row.amount),
+      },
+      {
+        header: "Payment Date",
+        key: "payment_date",
+        width: 18,
+        transform: (row) => formatDate(row.payment_date),
+      },
+      { header: "Notes", key: "notes", width: 40 },
     ],
-    data.repayments.map(
-      (row) => [
-        row.id,
-        row.loan_id,
-        row.amount,
-        row.payment_date,
-        row.payment_type,
-        row.notes || "",
+    data.tables.personal_loan_emi_payments
+  );
+
+  addExcelSheet(
+    workbook,
+    "Payments",
+    [
+      { header: "ID", key: "id", width: 10 },
+      { header: "Person", key: "person_name", width: 25 },
+      { header: "Category", key: "category", width: 15 },
+      {
+        header: "Amount",
+        key: "amount",
+        width: 18,
+        transform: (row) => formatAmount(row.amount),
+      },
+      {
+        header: "Payment Date",
+        key: "payment_date",
+        width: 18,
+        transform: (row) => formatDate(row.payment_date),
+      },
+      { header: "Status", key: "status", width: 15 },
+      {
+        header: "Received At",
+        key: "received_at",
+        width: 22,
+        transform: (row) =>
+          formatDateTime(row.received_at),
+      },
+      { header: "Notes", key: "notes", width: 40 },
+    ],
+    data.tables.personal_payments
+  );
+
+  if (hasRows(data.tables.personal_overview)) {
+    const keys = Object.keys(
+      data.tables.personal_overview[0]
+    );
+
+    addExcelSheet(
+      workbook,
+      "Overview",
+      keys.map((key) => ({
+        header: key.replace(/_/g, " "),
+        key,
+        width: 20,
+      })),
+      data.tables.personal_overview
+    );
+  }
+
+  if (data.period.period === "month") {
+    const weekly = calculateWeeklySummary(
+      data,
+      data.period.month
+    );
+
+    addExcelSheet(
+      workbook,
+      "Weekly Performance",
+      [
+        { header: "Week", key: "week", width: 10 },
+        {
+          header: "Period",
+          key: "period",
+          width: 14,
+          transform: (row) =>
+            `${row.startDay}-${row.endDay}`,
+        },
+        {
+          header: "Income",
+          key: "income",
+          width: 18,
+          transform: (row) =>
+            formatAmount(row.income),
+        },
+        {
+          header: "Expenses",
+          key: "expenses",
+          width: 18,
+          transform: (row) =>
+            formatAmount(row.expenses),
+        },
+        {
+          header: "EMI",
+          key: "emi",
+          width: 18,
+          transform: (row) => formatAmount(row.emi),
+        },
+        {
+          header: "Loan Repayment",
+          key: "loanRepayment",
+          width: 20,
+          transform: (row) =>
+            formatAmount(row.loanRepayment),
+        },
+        {
+          header: "Borrow Repayment",
+          key: "borrowRepayment",
+          width: 22,
+          transform: (row) =>
+            formatAmount(row.borrowRepayment),
+        },
+        {
+          header: "Outgoing",
+          key: "outgoing",
+          width: 18,
+          transform: (row) =>
+            formatAmount(row.outgoing),
+        },
+        {
+          header: "Net",
+          key: "net",
+          width: 18,
+          transform: (row) =>
+            formatAmount(row.net),
+        },
+        { header: "Status", key: "status", width: 16 },
+      ],
+      weekly.filter((row) => row.hasActivity)
+    );
+  }
+
+  return workbook;
+}
+
+// -----------------------------------------------------------------------------
+// TEXT EXPORT
+// -----------------------------------------------------------------------------
+
+function textLine(char = "-", count = 78) {
+  return char.repeat(count);
+}
+
+function textSection(title) {
+  return [
+    "",
+    textLine("="),
+    title.toUpperCase(),
+    textLine("="),
+  ].join("\n");
+}
+
+function tableText(headers, rows) {
+  if (!rows.length) return "";
+
+  const stringRows = [
+    headers,
+    ...rows.map((row) =>
+      row.map((value) => safeText(value))
+    ),
+  ];
+
+  const widths = headers.map((_, index) =>
+    Math.min(
+      32,
+      Math.max(
+        8,
+        ...stringRows.map((row) =>
+          String(row[index] ?? "").length
+        )
+      )
+    )
+  );
+
+  const separator =
+    "+" +
+    widths.map((width) => "-".repeat(width + 2)).join("+") +
+    "+";
+
+  const formatRow = (row) =>
+    "|" +
+    row
+      .map(
+        (value, index) =>
+          ` ${String(value ?? "")
+            .slice(0, widths[index])
+            .padEnd(widths[index])} `
+      )
+      .join("|") +
+    "|";
+
+  return [
+    separator,
+    formatRow(headers),
+    separator,
+    ...stringRows.slice(1).map(formatRow),
+    separator,
+  ].join("\n");
+}
+
+function createTextReport(data) {
+  const lines = [];
+
+  lines.push("PERSONAL FINANCIAL REPORT");
+  lines.push(textLine("="));
+  lines.push(
+    data.period.period === "week"
+      ? `Report: Week ${data.period.week} • ${data.period.monthTitle}`
+      : `Report: Monthly • ${data.period.monthTitle}`
+  );
+  lines.push(`Name: ${safeText(data.user.full_name)}`);
+  lines.push(`Profession: ${safeText(data.user.profession)}`);
+  lines.push(`Username: ${safeText(data.user.username)}`);
+  lines.push(`Email: ${safeText(data.user.email_address)}`);
+  lines.push(
+    `Period: ${formatDate(
+      data.period.startDate
+    )} to ${formatDate(
+      new Date(
+        `${data.period.endDateExclusive}T00:00:00`
+      ).getTime() - 86400000
+    )}`
+  );
+
+  lines.push(textSection("Financial Summary"));
+
+  const s = data.summary;
+
+  lines.push(
+    tableText(
+      ["Metric", "Amount"],
+      [
+        ["Received / Income", formatCurrency(s.received)],
+        ["Expenses", formatCurrency(s.expenses)],
+        ["EMI", formatCurrency(s.emi)],
+        [
+          "Loan Repayment",
+          formatCurrency(s.loanRepayment),
+        ],
+        [
+          "Borrow Repayment",
+          formatCurrency(s.borrowRepayment),
+        ],
+        ["Total Outgoing", formatCurrency(s.outgoing)],
+        ["Net Result", formatCurrency(s.net)],
+        ["Pending", formatCurrency(s.pending)],
+        ["Overdue", formatCurrency(s.overdue)],
+        ["Lost", formatCurrency(s.lost)],
+        [
+          "Active Loan",
+          formatCurrency(s.activeLoanTotal),
+        ],
+        [
+          "Active Borrow",
+          formatCurrency(s.activeBorrowTotal),
+        ],
+        [
+          "Business Total",
+          formatCurrency(s.businessTotal),
+        ],
+        ["Work Total", formatCurrency(s.workTotal)],
       ]
     )
   );
 
-  // ----------------------------------------------------------
-  // User details
-  // ----------------------------------------------------------
+  if (hasRows(data.categoryTotals)) {
+    lines.push(textSection("Expense Categories"));
 
-  addWorksheet(
-    workbook,
-    "User Details",
-    [
-      "Field",
-      "Value",
-    ],
-    [
-      [
-        "Name",
-        data.user.full_name,
-      ],
-      [
-        "Profession",
-        data.user.profession,
-      ],
-      [
-        "Username",
-        data.user.username,
-      ],
-      [
-        "Email",
-        data.user.email_address,
-      ],
-      [
-        "Phone 1",
-        data.user.phone1,
-      ],
-      [
-        "Phone 2",
-        data.user.phone2,
-      ],
-      [
-        "City",
-        data.user.city,
-      ],
-      [
-        "Taluka",
-        data.user.taluka,
-      ],
-      [
-        "District",
-        data.user.district,
-      ],
-      [
-        "State",
-        data.user.state,
-      ],
-      [
-        "Pincode",
-        data.user.pincode,
-      ],
-    ]
-  );
+    const total = data.categoryTotals.reduce(
+      (sum, row) => sum + asNumber(row.amount),
+      0
+    );
 
-  // ----------------------------------------------------------
-  // Professional number format
-  // ----------------------------------------------------------
+    lines.push(
+      tableText(
+        ["Category", "Amount", "Share"],
+        data.categoryTotals.map((row) => [
+          row.category,
+          formatCurrency(row.amount),
+          total > 0
+            ? `${(
+                (asNumber(row.amount) / total) *
+                100
+              ).toFixed(1)}%`
+            : "0%",
+        ])
+      )
+    );
+  }
 
-  workbook.worksheets.forEach(
-    (worksheet) => {
-      worksheet.eachRow(
-        (row) => {
-          row.eachCell(
-            (cell) => {
-              if (
-                typeof cell.value ===
-                "number"
-              ) {
-                cell.numFmt =
-                  '₹#,##0.00';
-              }
-            }
-          );
-        }
+  if (hasRows(data.tables.personal_business_work)) {
+    lines.push(textSection("Business / Work"));
+
+    lines.push(
+      tableText(
+        [
+          "Type",
+          "Name",
+          "Amount",
+          "Status",
+          "Start",
+          "End",
+          "Notes",
+        ],
+        data.tables.personal_business_work.map(
+          (row) => [
+            safeText(row.type),
+            safeText(row.name),
+            formatCurrency(row.amount),
+            safeText(row.status),
+            formatDate(row.start_date),
+            formatDate(row.end_date),
+            safeText(row.notes),
+          ]
+        )
+      )
+    );
+  }
+
+  if (hasRows(data.tables.personal_expenses)) {
+    lines.push(textSection("Expenses"));
+
+    lines.push(
+      tableText(
+        ["Category", "Amount", "Date", "Notes"],
+        data.tables.personal_expenses.map(
+          (row) => [
+            safeText(row.category),
+            formatCurrency(row.amount),
+            formatDate(row.expense_date),
+            safeText(row.notes),
+          ]
+        )
+      )
+    );
+  }
+
+  if (hasRows(data.tables.personal_loans_borrow)) {
+    lines.push(textSection("Loans / Borrow"));
+
+    lines.push(
+      tableText(
+        [
+          "Type",
+          "Name",
+          "Amount",
+          "EMI",
+          "Status",
+          "Start",
+          "End / Return",
+          "Notes",
+        ],
+        data.tables.personal_loans_borrow.map(
+          (row) => [
+            safeText(row.type),
+            safeText(row.name),
+            formatCurrency(row.amount),
+            formatCurrency(row.emi),
+            safeText(row.status),
+            formatDate(row.start_date),
+            formatDate(
+              row.return_date || row.end_date
+            ),
+            safeText(row.notes),
+          ]
+        )
+      )
+    );
+  }
+
+  if (
+    hasRows(
+      data.tables.personal_loan_emi_payments
+    )
+  ) {
+    lines.push(textSection("Loan / EMI Payments"));
+
+    lines.push(
+      tableText(
+        [
+          "Loan",
+          "Payment Type",
+          "Amount",
+          "Date",
+          "Notes",
+        ],
+        data.tables.personal_loan_emi_payments.map(
+          (row) => [
+            safeText(row.loan_name),
+            safeText(row.payment_type),
+            formatCurrency(row.amount),
+            formatDate(row.payment_date),
+            safeText(row.notes),
+          ]
+        )
+      )
+    );
+  }
+
+  if (hasRows(data.tables.personal_payments)) {
+    lines.push(textSection("Payments"));
+
+    lines.push(
+      tableText(
+        [
+          "Person",
+          "Category",
+          "Amount",
+          "Date",
+          "Status",
+          "Notes",
+        ],
+        data.tables.personal_payments.map(
+          (row) => [
+            safeText(row.person_name),
+            safeText(row.category),
+            formatCurrency(row.amount),
+            formatDate(row.payment_date),
+            safeText(row.status),
+            safeText(row.notes),
+          ]
+        )
+      )
+    );
+  }
+
+  if (hasRows(data.tables.personal_overview)) {
+    lines.push(textSection("Monthly Overview"));
+
+    const rows = data.tables.personal_overview;
+
+    const keys = Object.keys(rows[0] || {}).filter(
+      (key) =>
+        ![
+          "id",
+          "user_id",
+          "created_at",
+          "updated_at",
+        ].includes(key)
+    );
+
+    lines.push(
+      tableText(
+        ["Field", "Value"],
+        rows.flatMap((row) =>
+          keys.map((key) => [
+            key.replace(/_/g, " "),
+            safeText(row[key]),
+          ])
+        )
+      )
+    );
+  }
+
+  if (data.period.period === "month") {
+    const weekly = calculateWeeklySummary(
+      data,
+      data.period.month
+    ).filter((row) => row.hasActivity);
+
+    if (weekly.length) {
+      lines.push(textSection("Weekly Performance"));
+
+      lines.push(
+        tableText(
+          [
+            "Week",
+            "Period",
+            "Income",
+            "Expenses",
+            "EMI",
+            "Loan",
+            "Borrow",
+            "Outgoing",
+            "Net",
+            "Status",
+          ],
+          weekly.map((row) => [
+            `Week ${row.week}`,
+            `${row.startDay}-${row.endDay}`,
+            formatCurrency(row.income),
+            formatCurrency(row.expenses),
+            formatCurrency(row.emi),
+            formatCurrency(row.loanRepayment),
+            formatCurrency(row.borrowRepayment),
+            formatCurrency(row.outgoing),
+            formatCurrency(row.net),
+            row.status,
+          ])
+        )
       );
     }
+  }
+
+  lines.push("");
+  lines.push(textLine("-"));
+  lines.push(
+    `Generated: ${formatDateTime(new Date())}`
   );
-
-  res.setHeader(
-    "Content-Type",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-  );
-
-  res.setHeader(
-    "Content-Disposition",
-    `attachment; filename="${filename}"`
-  );
-
-  await workbook.xlsx.write(
-    res
-  );
-
-  res.end();
-};
-
-// ============================================================
-// BUILD TEXT
-// ============================================================
-
-const buildText = (
-  data
-) => {
-  const lines = [];
-
-  const add = (text = "") =>
-    lines.push(text);
-
-  const section = (
-    title
-  ) => {
-    add("");
-    add("=".repeat(72));
-    add(title);
-    add("=".repeat(72));
-  };
-
-  add(
-    "PERSONAL FINANCIAL REPORT"
-  );
-
-  add(
-    `Name    : ${safeText(
-      data.user.full_name
-    )}`
-  );
-
-  add(
-    `Month   : ${data.month}`
-  );
-
-  add(
-    `Status  : ${data.summary.status}`
-  );
-
-  section(
-    "MONTHLY SUMMARY"
-  );
-
-  add(
-    `Total Income        : ${money(
-      data.summary.total_income
-    )}`
-  );
-
-  add(
-    `Total Expenses      : ${money(
-      data.summary.total_expenses
-    )}`
-  );
-
-  add(
-    `EMI                 : ${money(
-      data.summary.total_emi
-    )}`
-  );
-
-  add(
-    `Loan Repayment      : ${money(
-      data.summary.total_loan_repayment
-    )}`
-  );
-
-  add(
-    `Borrow Repayment    : ${money(
-      data.summary.total_borrow_repayment
-    )}`
-  );
-
-  add(
-    `Total Outgoing      : ${money(
-      data.summary.total_outgoing
-    )}`
-  );
-
-  add(
-    `Net                 : ${money(
-      data.summary.net
-    )}`
-  );
-
-  add(
-    `Savings             : ${money(
-      data.summary.savings
-    )}`
-  );
-
-  add(
-    `Loss                : ${money(
-      data.summary.loss
-    )}`
-  );
-
-  add(
-    `Pending             : ${money(
-      data.summary.pending
-    )}`
-  );
-
-  add(
-    `Overdue             : ${money(
-      data.summary.overdue
-    )}`
-  );
-
-  add(
-    `Lost                : ${money(
-      data.summary.lost
-    )}`
-  );
-
-  section(
-    "OVERVIEW"
-  );
-
-  add(
-    `Total Business      : ${safeText(
-      data.overview.total_business
-    )}`
-  );
-
-  add(
-    `Total Works         : ${safeText(
-      data.overview.total_works
-    )}`
-  );
-
-  add(
-    `Business Payment    : ${money(
-      data.overview.business_payment
-    )}`
-  );
-
-  add(
-    `Work Payment        : ${money(
-      data.overview.work_payment
-    )}`
-  );
-
-  section(
-    "WEEKLY PERFORMANCE"
-  );
-
-  data.weekly.forEach(
-    (row) => {
-      add(
-        `Week ${row.week} | Income: ${money(
-          row.income
-        )} | Expense: ${money(
-          row.expenses
-        )} | Loan/EMI: ${money(
-          row.loan_emi +
-          row.loan_repayment
-        )} | Borrow: ${money(
-          row.borrow_repayment
-        )} | Net: ${money(
-          row.net
-        )} | ${row.status}`
-      );
-    }
-  );
-
-  section(
-    "EXPENSE CATEGORIES"
-  );
-
-  data.expenseCategories.forEach(
-    (row) => {
-      add(
-        `${row.category}: ${money(
-          row.total
-        )}`
-      );
-    }
-  );
-
-  section(
-    "PAYMENTS"
-  );
-
-  data.payments.forEach(
-    (row) => {
-      add(
-        `${row.person_name} | ${row.category} | ${money(
-          row.amount
-        )} | ${row.payment_date} | ${row.status}`
-      );
-    }
-  );
-
-  section(
-    "EXPENSES"
-  );
-
-  data.expenses.forEach(
-    (row) => {
-      add(
-        `${row.category} | ${money(
-          row.amount
-        )} | ${row.expense_date} | ${safeText(
-          row.notes
-        )}`
-      );
-    }
-  );
-
-  section(
-    "LOANS & BORROW"
-  );
-
-  data.loans.forEach(
-    (row) => {
-      const due =
-        row.type === "Loan"
-          ? row.end_date
-          : row.return_date;
-
-      add(
-        `${row.name} | ${row.type} | ${money(
-          row.amount
-        )} | EMI: ${money(
-          row.emi
-        )} | Due: ${safeText(
-          due
-        )} | ${row.status}`
-      );
-    }
-  );
-
-  section(
-    "REPAYMENTS"
-  );
-
-  data.repayments.forEach(
-    (row) => {
-      add(
-        `Loan ID ${row.loan_id} | ${money(
-          row.amount
-        )} | ${row.payment_date} | ${row.payment_type} | ${safeText(
-          row.notes
-        )}`
-      );
-    }
-  );
-
-  add("");
-  add(
-    `Generated on: ${new Date().toLocaleString(
-      "en-IN"
-    )}`
-  );
-
-  add(
-    "Personal Dashboard Export"
-  );
+  lines.push("Personal Dashboard");
+  lines.push("");
 
   return lines.join("\n");
-};
+}
 
-// ============================================================
-// 1. EXPORT PDF
-// GET /api/export-details/pdf?month=2026-08
-// ============================================================
+// -----------------------------------------------------------------------------
+// EXPORT ROUTE
+// -----------------------------------------------------------------------------
 
-router.get(
-  "/pdf",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
+router.get("/", requireUser, async (req, res) => {
+  try {
+    const format = String(
+      req.query.format || "pdf"
+    ).toLowerCase();
 
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const safeMonth =
-        month.replace(
-          /[^0-9-]/g,
-          ""
-        );
-
-      buildPdf(
-        data,
-        res,
-        `Personal_Report_${safeMonth}.pdf`
-      );
-    } catch (error) {
-      console.error(
-        "❌ PDF export error:",
-        error
-      );
-
-      if (!res.headersSent) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Failed to generate PDF",
-          error: error.message,
-        });
-      }
-
-      res.end();
+    if (!["pdf", "excel", "text"].includes(format)) {
+      return res.status(400).json({
+        success: false,
+        message:
+          "Invalid format. Use pdf, excel or text.",
+      });
     }
-  }
-);
 
-// ============================================================
-// 2. EXPORT EXCEL
-// GET /api/export-details/excel?month=2026-08
-//
-// Excel contains separate sheets so no long text is hidden
-// inside one overloaded sheet.
-// ============================================================
+    const periodInfo = getPeriod(req);
 
-router.get(
-  "/excel",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
+    /*
+      For weekly reports, load exactly the selected week.
+      For monthly reports, load the complete month.
+    */
+    const data = await loadReportData(
+      req.exportUserId,
+      periodInfo
+    );
 
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const safeMonth =
-        month.replace(
-          /[^0-9-]/g,
-          ""
-        );
-
-      await buildExcel(
-        data,
-        res,
-        `Personal_Report_${safeMonth}.xlsx`
-      );
-    } catch (error) {
-      console.error(
-        "❌ Excel export error:",
-        error
-      );
-
-      if (!res.headersSent) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Failed to generate Excel",
-          error: error.message,
-        });
-      }
-
-      res.end();
+    if (format === "pdf") {
+      return sendPdf(res, data);
     }
-  }
-);
 
-// ============================================================
-// 3. EXPORT TEXT
-// GET /api/export-details/text?month=2026-08
-// ============================================================
+    if (format === "text") {
+      const text = createTextReport(data);
 
-router.get(
-  "/text",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
+      const filename =
+        `Personal_Financial_${periodInfo.period}_` +
+        `${periodInfo.month}` +
+        (periodInfo.week
+          ? `_Week_${periodInfo.week}`
+          : "") +
+        ".txt";
 
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const text =
-        buildText(data);
-
-      const safeMonth =
-        month.replace(
-          /[^0-9-]/g,
-          ""
-        );
-
+      res.status(200);
       res.setHeader(
         "Content-Type",
         "text/plain; charset=utf-8"
       );
-
       res.setHeader(
         "Content-Disposition",
-        `attachment; filename="Personal_Report_${safeMonth}.txt"`
+        `attachment; filename="${filename}"`
       );
+      res.setHeader("Cache-Control", "no-store");
 
       return res.send(text);
-    } catch (error) {
-      console.error(
-        "❌ Text export error:",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Failed to generate text report",
-        error: error.message,
-      });
     }
-  }
-);
 
-// ============================================================
-// 4. EXPORT JSON
-// GET /api/export-details/json?month=2026-08
-//
-// Useful for frontend preview before downloading.
-// ============================================================
+    const workbook = await createExcelWorkbook(data);
 
-router.get(
-  "/json",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
+    const filename =
+      `Personal_Financial_${periodInfo.period}_` +
+      `${periodInfo.month}` +
+      (periodInfo.week
+        ? `_Week_${periodInfo.week}`
+        : "") +
+      ".xlsx";
 
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
+    res.status(200);
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${filename}"`
+    );
+    res.setHeader("Cache-Control", "no-store");
 
-      return res.json({
-        success: true,
-        data,
-      });
-    } catch (error) {
-      console.error(
-        "❌ JSON export error:",
-        error
-      );
+    await workbook.xlsx.write(res);
+    return res.end();
+  } catch (error) {
+    console.error("Export details error:", error);
 
-      return res.status(500).json({
-        success: false,
-        message:
-          "Failed to prepare export data",
-        error: error.message,
-      });
+    if (res.headersSent) {
+      return res.end();
     }
+
+    return res.status(error.status || 500).json({
+      success: false,
+      message:
+        error.message || "Failed to generate export.",
+    });
   }
-);
-
-// ============================================================
-// 5. EXPORT OVERVIEW ONLY PDF
-// GET /api/export-details/overview/pdf?month=2026-08
-// ============================================================
-
-router.get(
-  "/overview/pdf",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
-
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const doc =
-        new PDFDocument({
-          size: "A4",
-          margins: {
-            top: PDF_MARGIN,
-            bottom: PDF_MARGIN,
-            left: PDF_MARGIN,
-            right: PDF_MARGIN,
-          },
-          bufferPages: true,
-          info: {
-            Title:
-              `Overview Report - ${month}`,
-            Author:
-              safeText(
-                data.user.full_name
-              ),
-          },
-        });
-
-      res.setHeader(
-        "Content-Type",
-        "application/pdf"
-      );
-
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="Overview_Report_${month}.pdf"`
-      );
-
-      doc.pipe(res);
-
-      drawPdfTitle(
-        doc,
-        "Overview Report",
-        `${safeText(
-          data.user.full_name
-        )} • ${month}`
-      );
-
-      drawPdfSection(
-        doc,
-        "Overview Details"
-      );
-
-      drawPdfLine(
-        doc,
-        "Total Business",
-        data.overview.total_business
-      );
-
-      drawPdfLine(
-        doc,
-        "Total Works",
-        data.overview.total_works
-      );
-
-      drawPdfLine(
-        doc,
-        "Business Payment",
-        money(
-          data.overview.business_payment
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Work Payment",
-        money(
-          data.overview.work_payment
-        )
-      );
-
-      drawPdfSection(
-        doc,
-        "Selected Month Financial Result"
-      );
-
-      drawPdfLine(
-        doc,
-        "Income",
-        money(
-          data.summary.total_income
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Expense",
-        money(
-          data.summary.total_expenses
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Total Outgoing",
-        money(
-          data.summary.total_outgoing
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Net",
-        money(data.summary.net)
-      );
-
-      drawPdfLine(
-        doc,
-        "Status",
-        data.summary.status
-      );
-
-      drawPdfSection(
-        doc,
-        "Upcoming / Outstanding"
-      );
-
-      drawPdfLine(
-        doc,
-        "Pending Payments",
-        money(
-          data.summary.pending
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Overdue Payments",
-        money(
-          data.summary.overdue
-        )
-      );
-
-      drawPdfLine(
-        doc,
-        "Lost Payments",
-        money(
-          data.summary.lost
-        )
-      );
-
-      const range =
-        doc.bufferedPageRange();
-
-      for (
-        let index = range.start;
-        index <
-        range.start + range.count;
-        index++
-      ) {
-        doc.switchToPage(
-          index
-        );
-
-        doc
-          .fontSize(7)
-          .font("Helvetica")
-          .text(
-            `© ${new Date().getFullYear()} Personal Dashboard • Page ${index + 1} of ${range.count}`,
-            PDF_MARGIN,
-            doc.page.height - 25,
-            {
-              width:
-                doc.page.width -
-                PDF_MARGIN * 2,
-              align: "center",
-            }
-          );
-      }
-
-      doc.end();
-    } catch (error) {
-      console.error(
-        "❌ Overview PDF export error:",
-        error
-      );
-
-      if (!res.headersSent) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Failed to generate overview PDF",
-          error: error.message,
-        });
-      }
-
-      res.end();
-    }
-  }
-);
-
-// ============================================================
-// 6. EXPORT OVERVIEW ONLY EXCEL
-// GET /api/export-details/overview/excel
-// ============================================================
-
-router.get(
-  "/overview/excel",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
-
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const workbook =
-        new ExcelJS.Workbook();
-
-      const worksheet =
-        workbook.addWorksheet(
-          "Overview"
-        );
-
-      worksheet.addRows([
-        [
-          "Personal Dashboard Overview",
-          "",
-        ],
-        [
-          "Name",
-          data.user.full_name,
-        ],
-        [
-          "Month",
-          month,
-        ],
-        [
-          "Total Business",
-          data.overview.total_business,
-        ],
-        [
-          "Total Works",
-          data.overview.total_works,
-        ],
-        [
-          "Business Payment",
-          toNumber(
-            data.overview.business_payment
-          ),
-        ],
-        [
-          "Work Payment",
-          toNumber(
-            data.overview.work_payment
-          ),
-        ],
-        [
-          "Monthly Income",
-          data.summary.total_income,
-        ],
-        [
-          "Monthly Expense",
-          data.summary.total_expenses,
-        ],
-        [
-          "Total Outgoing",
-          data.summary.total_outgoing,
-        ],
-        [
-          "Net",
-          data.summary.net,
-        ],
-        [
-          "Savings",
-          data.summary.savings,
-        ],
-        [
-          "Loss",
-          data.summary.loss,
-        ],
-        [
-          "Status",
-          data.summary.status,
-        ],
-      ]);
-
-      worksheet.columns = [
-        {
-          width: 28,
-        },
-        {
-          width: 30,
-        },
-      ];
-
-      worksheet.eachRow(
-        (row, rowNumber) => {
-          row.eachCell(
-            (cell) => {
-              cell.alignment = {
-                vertical:
-                  "middle",
-                wrapText: true,
-              };
-
-              if (
-                rowNumber === 1
-              ) {
-                cell.font = {
-                  bold: true,
-                  size: 14,
-                };
-              }
-            }
-          );
-
-          row.height =
-            rowNumber === 1
-              ? 28
-              : 22;
-        }
-      );
-
-      worksheet.eachRow(
-        (row) => {
-          row.eachCell(
-            (cell) => {
-              if (
-                typeof cell.value ===
-                "number"
-              ) {
-                cell.numFmt =
-                  '₹#,##0.00';
-              }
-            }
-          );
-        }
-      );
-
-      res.setHeader(
-        "Content-Type",
-        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-      );
-
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="Overview_Report_${month}.xlsx"`
-      );
-
-      await workbook.xlsx.write(
-        res
-      );
-
-      res.end();
-    } catch (error) {
-      console.error(
-        "❌ Overview Excel export error:",
-        error
-      );
-
-      if (!res.headersSent) {
-        return res.status(500).json({
-          success: false,
-          message:
-            "Failed to generate overview Excel",
-          error: error.message,
-        });
-      }
-
-      res.end();
-    }
-  }
-);
-
-// ============================================================
-// 7. EXPORT OVERVIEW ONLY TEXT
-// GET /api/export-details/overview/text
-// ============================================================
-
-router.get(
-  "/overview/text",
-  authenticate,
-  async (req, res) => {
-    try {
-      const month =
-        req.query.month ||
-        getCurrentMonth();
-
-      const data =
-        await getExportData(
-          req.userId,
-          month
-        );
-
-      const lines = [
-        "PERSONAL DASHBOARD - OVERVIEW",
-        "=".repeat(60),
-        `Name: ${safeText(
-          data.user.full_name
-        )}`,
-        `Month: ${month}`,
-        "",
-        "OVERVIEW",
-        "-".repeat(60),
-        `Total Business: ${safeText(
-          data.overview.total_business
-        )}`,
-        `Total Works: ${safeText(
-          data.overview.total_works
-        )}`,
-        `Business Payment: ${money(
-          data.overview.business_payment
-        )}`,
-        `Work Payment: ${money(
-          data.overview.work_payment
-        )}`,
-        "",
-        "MONTHLY FINANCIAL RESULT",
-        "-".repeat(60),
-        `Income: ${money(
-          data.summary.total_income
-        )}`,
-        `Expense: ${money(
-          data.summary.total_expenses
-        )}`,
-        `Total Outgoing: ${money(
-          data.summary.total_outgoing
-        )}`,
-        `Net: ${money(
-          data.summary.net
-        )}`,
-        `Savings: ${money(
-          data.summary.savings
-        )}`,
-        `Loss: ${money(
-          data.summary.loss
-        )}`,
-        `Status: ${data.summary.status}`,
-        "",
-        "PAYMENT STATUS",
-        "-".repeat(60),
-        `Pending: ${money(
-          data.summary.pending
-        )}`,
-        `Overdue: ${money(
-          data.summary.overdue
-        )}`,
-        `Lost: ${money(
-          data.summary.lost
-        )}`,
-        "",
-        `Generated: ${new Date().toLocaleString(
-          "en-IN"
-        )}`,
-      ];
-
-      res.setHeader(
-        "Content-Type",
-        "text/plain; charset=utf-8"
-      );
-
-      res.setHeader(
-        "Content-Disposition",
-        `attachment; filename="Overview_Report_${month}.txt"`
-      );
-
-      return res.send(
-        lines.join("\n")
-      );
-    } catch (error) {
-      console.error(
-        "❌ Overview text export error:",
-        error
-      );
-
-      return res.status(500).json({
-        success: false,
-        message:
-          "Failed to generate overview text",
-        error: error.message,
-      });
-    }
-  }
-);
-
-// ============================================================
-// EXPORT
-// ============================================================
+});
 
 module.exports = router;
