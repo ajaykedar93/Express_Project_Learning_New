@@ -122,8 +122,6 @@ router.get("/", authenticateToken, async (req, res) => {
             SELECT 
                 c.id as category_id,
                 c.category_name,
-                c.icon,
-                c.color,
                 COALESCE(SUM(e.amount), 0) as total_amount,
                 COUNT(e.id) as expense_count
             FROM personal_expense_categories c
@@ -132,7 +130,7 @@ router.get("/", authenticateToken, async (req, res) => {
                 AND e.user_id = $1 
                 AND DATE_TRUNC('month', e.expense_date) = $2::DATE
             WHERE c.user_id = $1
-            GROUP BY c.id, c.category_name, c.icon, c.color
+            GROUP BY c.id, c.category_name
             ORDER BY total_amount DESC
         `;
         const categoryExpenseResult = await db.query(categoryExpenseQuery, [userId, monthStart]);
@@ -140,8 +138,8 @@ router.get("/", authenticateToken, async (req, res) => {
         const categoryBreakdown = categoryExpenseResult.rows.map(row => ({
             category_id: row.category_id,
             category_name: row.category_name,
-            icon: row.icon || '📊',
-            color: row.color || '#3B82F6',
+            icon: '📊',
+            color: '#3B82F6',
             total_amount: parseFloat(row.total_amount),
             expense_count: parseInt(row.expense_count),
             percentage: totalExpenses > 0 ? ((parseFloat(row.total_amount) / totalExpenses) * 100) : 0
@@ -180,11 +178,12 @@ router.get("/", authenticateToken, async (req, res) => {
         // 5. GET TOTAL BORROW
         // ============================================================
         const borrowQuery = `
-            SELECT 
-                COALESCE(SUM(borrow_amount), 0) as total_borrow,
+            SELECT
+                COALESCE(SUM(total_amount), 0) as total_borrow,
                 COUNT(*) as borrow_count
-            FROM personal_borrow
-            WHERE user_id = $1 
+            FROM personal_loans_borrow
+            WHERE user_id = $1
+            AND type = 'Borrow'
             AND DATE_TRUNC('month', take_date) = $2::DATE
         `;
         const borrowResult = await db.query(borrowQuery, [userId, monthStart]);
@@ -195,12 +194,13 @@ router.get("/", authenticateToken, async (req, res) => {
         // 6. GET TOTAL LOAN
         // ============================================================
         const loanQuery = `
-            SELECT 
-                COALESCE(SUM(total_loan_amount), 0) as total_loan,
+            SELECT
+                COALESCE(SUM(total_amount), 0) as total_loan,
                 COUNT(*) as loan_count
-            FROM personal_loans
-            WHERE user_id = $1 
-            AND DATE_TRUNC('month', created_at) = $2::DATE
+            FROM personal_loans_borrow
+            WHERE user_id = $1
+            AND type = 'Loan'
+            AND DATE_TRUNC('month', take_date) = $2::DATE
         `;
         const loanResult = await db.query(loanQuery, [userId, monthStart]);
         const totalLoan = parseFloat(loanResult.rows[0].total_loan);
@@ -211,7 +211,12 @@ router.get("/", authenticateToken, async (req, res) => {
         // ============================================================
         const emiQuery = `
             SELECT 
-                COALESCE(SUM(emi_amount), 0) as total_emi_paid,
+                COALESCE(SUM(
+                    CASE
+                        WHEN payment_type = 'EMI' THEN amount
+                        ELSE 0
+                    END
+                ), 0) as total_emi_paid,
                 COUNT(*) as emi_count
             FROM personal_loan_emi_payments
             WHERE user_id = $1 
@@ -227,20 +232,43 @@ router.get("/", authenticateToken, async (req, res) => {
         const activeLoanQuery = `
             SELECT 
                 l.id,
-                l.bank_name,
-                l.total_loan_amount,
+                l.person_or_bank_name as bank_name,
+                l.total_amount as total_loan_amount,
                 l.emi_amount,
-                l.total_emis,
+                l.number_of_emis as total_emis,
                 l.next_emi_date,
                 l.status,
-                COUNT(e.id) as paid_emis,
-                (l.total_emis - COUNT(e.id)) as remaining_emis,
-                COALESCE(SUM(e.emi_amount), 0) as total_paid,
+                COUNT(CASE WHEN e.payment_type = 'EMI' THEN 1 END) as paid_emis,
+                GREATEST(
+                    l.number_of_emis -
+                    COUNT(CASE WHEN e.payment_type = 'EMI' THEN 1 END),
+                    0
+                ) as remaining_emis,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN e.payment_type = 'EMI' THEN e.amount
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) as total_paid,
                 (l.next_emi_date - CURRENT_DATE) as days_until_next_emi
-            FROM personal_loans l
-            LEFT JOIN personal_loan_emi_payments e ON l.id = e.loan_id
-            WHERE l.user_id = $1 AND l.status = 'active'
-            GROUP BY l.id
+            FROM personal_loans_borrow l
+            LEFT JOIN personal_loan_emi_payments e
+                ON l.id = e.loan_borrow_id
+               AND l.user_id = e.user_id
+            WHERE l.user_id = $1
+              AND l.type = 'Loan'
+              AND l.status = 'Active'
+            GROUP BY
+                l.id,
+                l.person_or_bank_name,
+                l.total_amount,
+                l.emi_amount,
+                l.number_of_emis,
+                l.next_emi_date,
+                l.status
             ORDER BY l.next_emi_date ASC
         `;
         const activeLoanResult = await db.query(activeLoanQuery, [userId]);
@@ -268,18 +296,50 @@ router.get("/", authenticateToken, async (req, res) => {
         const activeBorrowQuery = `
             SELECT 
                 b.id,
-                b.person_name,
-                b.borrow_amount,
+                b.person_or_bank_name as person_name,
+                b.total_amount as borrow_amount,
                 b.take_date,
                 b.return_date,
                 b.status,
-                COALESCE(SUM(r.repayment_amount), 0) as total_repaid,
-                (b.borrow_amount - COALESCE(SUM(r.repayment_amount), 0)) as remaining_amount,
+                COALESCE(
+                    SUM(
+                        CASE
+                            WHEN r.payment_type = 'Borrow Repayment'
+                            THEN r.amount
+                            ELSE 0
+                        END
+                    ),
+                    0
+                ) as total_repaid,
+                GREATEST(
+                    b.total_amount -
+                    COALESCE(
+                        SUM(
+                            CASE
+                                WHEN r.payment_type = 'Borrow Repayment'
+                                THEN r.amount
+                                ELSE 0
+                            END
+                        ),
+                        0
+                    ),
+                    0
+                ) as remaining_amount,
                 (b.return_date - CURRENT_DATE) as days_remaining
-            FROM personal_borrow b
-            LEFT JOIN personal_borrow_repayments r ON b.id = r.borrow_id
-            WHERE b.user_id = $1 AND b.status = 'active'
-            GROUP BY b.id
+            FROM personal_loans_borrow b
+            LEFT JOIN personal_loan_emi_payments r
+                ON b.id = r.loan_borrow_id
+               AND b.user_id = r.user_id
+            WHERE b.user_id = $1
+              AND b.type = 'Borrow'
+              AND b.status = 'Active'
+            GROUP BY
+                b.id,
+                b.person_or_bank_name,
+                b.total_amount,
+                b.take_date,
+                b.return_date,
+                b.status
             ORDER BY b.return_date ASC
         `;
         const activeBorrowResult = await db.query(activeBorrowQuery, [userId]);
@@ -303,10 +363,10 @@ router.get("/", authenticateToken, async (req, res) => {
         // ============================================================
         const paymentQuery = `
             SELECT 
-                COALESCE(SUM(CASE WHEN status = 'received' THEN amount ELSE 0 END), 0) as total_received,
-                COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as total_pending,
-                COALESCE(SUM(CASE WHEN status = 'overdue' THEN amount ELSE 0 END), 0) as total_overdue,
-                COALESCE(SUM(CASE WHEN status = 'lost' THEN amount ELSE 0 END), 0) as total_lost,
+                COALESCE(SUM(CASE WHEN status = 'Received' THEN amount ELSE 0 END), 0) as total_received,
+                COALESCE(SUM(CASE WHEN status = 'Pending' THEN amount ELSE 0 END), 0) as total_pending,
+                COALESCE(SUM(CASE WHEN status = 'Overdue' THEN amount ELSE 0 END), 0) as total_overdue,
+                COALESCE(SUM(CASE WHEN status = 'Lost' THEN amount ELSE 0 END), 0) as total_lost,
                 COALESCE(SUM(amount), 0) as total_payments,
                 COUNT(*) as payment_count
             FROM personal_payments
@@ -347,16 +407,16 @@ router.get("/", authenticateToken, async (req, res) => {
         };
 
         paymentStatusResult.rows.forEach(row => {
-            if (row.status === 'received') {
+            if (String(row.status).toLowerCase() === 'received') {
                 paymentStatusBreakdown.received.count = parseInt(row.count);
                 paymentStatusBreakdown.received.amount = parseFloat(row.total_amount);
-            } else if (row.status === 'pending') {
+            } else if (String(row.status).toLowerCase() === 'pending') {
                 paymentStatusBreakdown.pending.count = parseInt(row.count);
                 paymentStatusBreakdown.pending.amount = parseFloat(row.total_amount);
-            } else if (row.status === 'overdue') {
+            } else if (String(row.status).toLowerCase() === 'overdue') {
                 paymentStatusBreakdown.overdue.count = parseInt(row.count);
                 paymentStatusBreakdown.overdue.amount = parseFloat(row.total_amount);
-            } else if (row.status === 'lost') {
+            } else if (String(row.status).toLowerCase() === 'lost') {
                 paymentStatusBreakdown.lost.count = parseInt(row.count);
                 paymentStatusBreakdown.lost.amount = parseFloat(row.total_amount);
             }
@@ -394,7 +454,7 @@ router.get("/", authenticateToken, async (req, res) => {
                 e.expense_date as transaction_date,
                 e.notes as description,
                 c.category_name as name,
-                c.icon,
+                '📊' as icon,
                 'expense' as category_type
             FROM personal_expenses e
             JOIN personal_expense_categories c ON e.category_id = c.id
@@ -437,10 +497,20 @@ router.get("/", authenticateToken, async (req, res) => {
             SELECT 
                 (SELECT COALESCE(SUM(work_payment + business_payment), 0) FROM personal_overview WHERE user_id = $1) as all_income,
                 (SELECT COALESCE(SUM(amount), 0) FROM personal_expenses WHERE user_id = $1) as all_expenses,
-                (SELECT COALESCE(SUM(borrow_amount), 0) FROM personal_borrow WHERE user_id = $1) as all_borrow,
-                (SELECT COALESCE(SUM(total_loan_amount), 0) FROM personal_loans WHERE user_id = $1) as all_loan,
-                (SELECT COALESCE(SUM(emi_amount), 0) FROM personal_loan_emi_payments WHERE user_id = $1) as all_emi_paid,
-                (SELECT COALESCE(SUM(amount), 0) FROM personal_payments WHERE user_id = $1 AND status = 'received') as all_received
+                (SELECT COALESCE(SUM(total_amount), 0)
+                 FROM personal_loans_borrow
+                 WHERE user_id = $1 AND type = 'Borrow') as all_borrow,
+                (SELECT COALESCE(SUM(total_amount), 0)
+                 FROM personal_loans_borrow
+                 WHERE user_id = $1 AND type = 'Loan') as all_loan,
+                (SELECT COALESCE(SUM(
+                    CASE WHEN payment_type = 'EMI' THEN amount ELSE 0 END
+                ), 0)
+                 FROM personal_loan_emi_payments
+                 WHERE user_id = $1) as all_emi_paid,
+                (SELECT COALESCE(SUM(amount), 0)
+                 FROM personal_payments
+                 WHERE user_id = $1 AND status = 'Received') as all_received
         `;
         const quickStatsResult = await db.query(quickStatsQuery, [userId]);
 
@@ -451,8 +521,8 @@ router.get("/", authenticateToken, async (req, res) => {
             all_time_loan: parseFloat(quickStatsResult.rows[0].all_loan),
             all_time_emi_paid: parseFloat(quickStatsResult.rows[0].all_emi_paid),
             all_time_received: parseFloat(quickStatsResult.rows[0].all_received),
-            all_time_savings: parseFloat(quickStatsResult.rows[0].all_income) - 
-                               parseFloat(quickStatsResult.rows[0].all_expenses) + 
+            all_time_savings: parseFloat(quickStatsResult.rows[0].all_income) -
+                               parseFloat(quickStatsResult.rows[0].all_expenses) -
                                parseFloat(quickStatsResult.rows[0].all_emi_paid)
         };
 
@@ -548,14 +618,12 @@ router.get("/widgets", authenticateToken, async (req, res) => {
         const topExpensesQuery = `
             SELECT 
                 c.category_name,
-                c.icon,
-                c.color,
                 COALESCE(SUM(e.amount), 0) as total_amount
             FROM personal_expense_categories c
             JOIN personal_expenses e ON e.category_id = c.id
             WHERE e.user_id = $1 
             AND DATE_TRUNC('month', e.expense_date) = $2::DATE
-            GROUP BY c.id, c.category_name, c.icon, c.color
+            GROUP BY c.id, c.category_name
             ORDER BY total_amount DESC
             LIMIT 5
         `;
@@ -565,12 +633,14 @@ router.get("/widgets", authenticateToken, async (req, res) => {
         const upcomingEmisQuery = `
             SELECT 
                 id,
-                bank_name,
+                person_or_bank_name AS bank_name,
                 emi_amount,
                 next_emi_date,
                 (next_emi_date - CURRENT_DATE) as days_until
-            FROM personal_loans
-            WHERE user_id = $1 AND status = 'active'
+            FROM personal_loans_borrow
+            WHERE user_id = $1
+              AND type = 'Loan'
+              AND status = 'Active'
             ORDER BY next_emi_date ASC
             LIMIT 5
         `;
@@ -585,7 +655,7 @@ router.get("/widgets", authenticateToken, async (req, res) => {
                 payment_date,
                 (CURRENT_DATE - payment_date) as days_overdue
             FROM personal_payments
-            WHERE user_id = $1 AND status = 'overdue'
+            WHERE user_id = $1 AND status = 'Overdue'
             ORDER BY payment_date ASC
             LIMIT 5
         `;
@@ -596,6 +666,8 @@ router.get("/widgets", authenticateToken, async (req, res) => {
             data: {
                 top_expenses: topExpensesResult.rows.map(row => ({
                     ...row,
+                    icon: '📊',
+                    color: '#6366F1',
                     total_amount: parseFloat(row.total_amount)
                 })),
                 upcoming_emis: upcomingEmisResult.rows.map(row => ({
