@@ -15,8 +15,11 @@ const overviewRoutes = require("./routes/overviewapi");
 const expenseRoutes = require("./routes/expenseapi");
 const loanBorrowRoutes = require("./routes/loanBorrowapi");
 const paymentRoutes = require("./routes/paymentapi");
-const performanceRoutes = require("./routes/performanceapi");
-const summaryRoutes = require("./routes/summaryapi");
+
+
+// To this:
+const performanceRoutes = require("./routes/all_performance");
+
 const exportDetailsRoutes = require("./routes/exportDetailsapi");
 
 const personalTradingRoutes = require("./routes/personal_trading");
@@ -145,41 +148,15 @@ app.use(
     personalUserRoutes
 );
 
-// Personal Dashboard
-app.use(
-    "/api/personal-user",
-    personalUserRoutes
-);
 
-app.use(
-    "/api/overview",
-    overviewRoutes
-);
 
-app.use(
-    "/api/expenses",
-    expenseRoutes
-);
+app.use("/api/overview", overviewRoutes);
+app.use("/api/expenses", expenseRoutes);
+app.use("/api/loan-borrow", loanBorrowRoutes);
+app.use("/api/payments", paymentRoutes);
+app.use("/api/performance", performanceRoutes);
 
-app.use(
-    "/api/loan-borrow",
-    loanBorrowRoutes
-);
 
-app.use(
-    "/api/payments",
-    paymentRoutes
-);
-
-app.use(
-    "/api/performance",
-    performanceRoutes
-);
-
-app.use(
-    "/api/summary",
-    summaryRoutes
-);
 
 app.use(
     "/api/export-details",

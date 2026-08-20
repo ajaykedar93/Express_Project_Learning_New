@@ -1,1299 +1,788 @@
-// routes/overviewApi.js
-// Overview API - Business + Work management and selected-month overview
-// CommonJS / Express / PostgreSQL
-
 const express = require("express");
 const jwt = require("jsonwebtoken");
-
 const router = express.Router();
 const db = require("../db.js");
 
-// ============================================================
-// AUTHENTICATION
-// ============================================================
+// ==================== MIDDLEWARE ====================
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
 
-const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key";
-
-const authenticate = (req, res, next) => {
-  try {
-    const header = req.headers.authorization || "";
-
-    if (!header.startsWith("Bearer ")) {
-      return res.status(401).json({
-        success: false,
-        message: "Authentication token required",
-      });
+    if (!token) {
+        return res.status(401).json({ error: "Access denied. No token provided." });
     }
 
-    const token = header.substring(7);
-    const decoded = jwt.verify(token, JWT_SECRET);
-
-    if (!decoded?.id) {
-      return res.status(401).json({
-        success: false,
-        message: "Invalid authentication token",
-      });
-    }
-
-    req.userId = Number(decoded.id);
-    next();
-  } catch (error) {
-    return res.status(401).json({
-      success: false,
-      message: "Invalid or expired authentication token",
+    jwt.verify(token, process.env.JWT_SECRET || "your_secret_key", (err, user) => {
+        if (err) {
+            return res.status(403).json({ error: "Invalid or expired token." });
+        }
+        req.user = user;
+        next();
     });
-  }
 };
 
-// ============================================================
-// HELPERS
-// ============================================================
-
-const isValidDate = (value) => {
-  if (!value || typeof value !== "string") return false;
-  const date = new Date(`${value}T00:00:00`);
-  return !Number.isNaN(date.getTime());
+// ==================== HELPER FUNCTIONS ====================
+const parseMonthStart = (monthStr) => {
+    const date = new Date(monthStr);
+    if (isNaN(date.getTime())) {
+        throw new Error("Invalid date format. Use '1 Jan 2026'");
+    }
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    return `${year}-${month}-01`;
 };
 
-const getMonthRange = (month) => {
-  // Expected: YYYY-MM
-  if (!/^\d{4}-\d{2}$/.test(month || "")) {
-    return null;
-  }
-
-  const [year, monthNumber] = month.split("-").map(Number);
-
-  if (monthNumber < 1 || monthNumber > 12) {
-    return null;
-  }
-
-  const start = `${year}-${String(monthNumber).padStart(2, "0")}-01`;
-
-  const nextYear = monthNumber === 12 ? year + 1 : year;
-  const nextMonth = monthNumber === 12 ? 1 : monthNumber + 1;
-  const nextStart = `${nextYear}-${String(nextMonth).padStart(2, "0")}-01`;
-
-  return {
-    monthStart: start,
-    nextMonthStart: nextStart,
-  };
+const formatMonthDisplay = (dateStr) => {
+    const date = new Date(dateStr);
+    const day = date.getDate();
+    const month = date.toLocaleString('default', { month: 'short' });
+    const year = date.getFullYear();
+    return `${day} ${month} ${year}`;
 };
 
-const getCurrentMonth = () => {
-  const now = new Date();
-
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
+const getCurrentMonthStart = () => {
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    return `${year}-${month}-01`;
 };
 
-const normalizeType = (type) => {
-  if (!type) return null;
-
-  const value = String(type).trim().toLowerCase();
-
-  if (value === "business") return "Business";
-  if (value === "work") return "Work";
-
-  return null;
+const formatDate = (date) => {
+    const d = new Date(date);
+    const year = d.getFullYear();
+    const month = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
 };
 
-const normalizeStatus = (status) => {
-  if (!status) return "Active";
-
-  const value = String(status).trim().toLowerCase();
-
-  if (value === "active") return "Active";
-  if (value === "completed") return "Completed";
-  if (value === "paused") return "Paused";
-
-  return null;
-};
-
-const parsePositiveNumber = (value) => {
-  const number = Number(value);
-
-  if (!Number.isFinite(number) || number < 0) {
-    return null;
-  }
-
-  return number;
-};
-
-// ============================================================
-// CREATE / ENSURE TABLES
-// ============================================================
-
-const createTables = async () => {
-  try {
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS personal_business_work (
-        id SERIAL PRIMARY KEY,
-
-        user_id INTEGER NOT NULL
-          REFERENCES personal_users(id)
-          ON DELETE CASCADE,
-
-        name VARCHAR(200) NOT NULL,
-
-        type VARCHAR(20) NOT NULL
-          CHECK (type IN ('Business', 'Work')),
-
-        status VARCHAR(20) NOT NULL DEFAULT 'Active'
-          CHECK (status IN ('Active', 'Completed', 'Paused')),
-
-        amount NUMERIC(15,2) DEFAULT 0,
-
-        start_date DATE DEFAULT CURRENT_DATE,
-        end_date DATE,
-
-        notes TEXT,
-
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-        CONSTRAINT chk_business_work_amount
-          CHECK (amount >= 0),
-
-        CONSTRAINT chk_business_work_dates
-          CHECK (
-            end_date IS NULL
-            OR end_date >= start_date
-          )
-      )
-    `);
-
-    await db.query(`
-      CREATE TABLE IF NOT EXISTS personal_overview (
-        id SERIAL PRIMARY KEY,
-
-        user_id INTEGER NOT NULL
-          REFERENCES personal_users(id)
-          ON DELETE CASCADE,
-
-        month_start DATE NOT NULL,
-
-        total_business INTEGER NOT NULL DEFAULT 0,
-        total_works INTEGER NOT NULL DEFAULT 0,
-
-        business_payment NUMERIC(15,2) NOT NULL DEFAULT 0,
-        work_payment NUMERIC(15,2) NOT NULL DEFAULT 0,
-
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-        CONSTRAINT chk_overview_business
-          CHECK (total_business >= 0),
-
-        CONSTRAINT chk_overview_works
-          CHECK (total_works >= 0),
-
-        CONSTRAINT chk_business_payment
-          CHECK (business_payment >= 0),
-
-        CONSTRAINT chk_work_payment
-          CHECK (work_payment >= 0),
-
-        CONSTRAINT unique_user_overview_month
-          UNIQUE (user_id, month_start)
-      )
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_business_work_user
-      ON personal_business_work(user_id)
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_business_work_user_type
-      ON personal_business_work(user_id, type)
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_business_work_dates
-      ON personal_business_work(user_id, start_date, end_date)
-    `);
-
-    await db.query(`
-      CREATE INDEX IF NOT EXISTS idx_overview_user_month
-      ON personal_overview(user_id, month_start)
-    `);
-
-    console.log("✅ Overview tables ready");
-  } catch (error) {
-    console.error("❌ Overview table setup error:", error.message);
-  }
-};
-
-createTables();
-
-// ============================================================
-// 1. GET OVERVIEW
-// GET /api/overview?month=2026-08
-//
-// This returns:
-// - Manual total business
-// - Manual total work
-// - Manual business payment
-// - Manual work payment
-// - Automatically calculated monthly expenses
-// - Borrow
-// - Loan EMI
-// - Savings
-// - Profit/Loss/Saved status
-// - Upcoming loan/borrow count
-//
-// Financial totals are calculated from the other financial tables.
-// ============================================================
-
-router.get("/", authenticate, async (req, res) => {
-  try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    const { monthStart, nextMonthStart } = range;
-
-    // ============================================================
-    // MANUAL MONTHLY VALUES
-    // Only these 4 overview values are entered by the user manually:
-    // - Total Business
-    // - Total Work
-    // - Business Payment
-    // - Work Payment
-    //
-    // All other overview values below are calculated automatically
-    // from their respective financial tables.
-    // ============================================================
-    const manualOverviewResult = await db.query(
-      `
-      SELECT
-        total_business,
-        total_works,
-        business_payment,
-        work_payment
-      FROM personal_overview
-      WHERE user_id = $1
-        AND month_start = $2::DATE
-      LIMIT 1
-      `,
-      [req.userId, monthStart]
-    );
-
-    // Monthly expenses.
-    const expenseResult = await db.query(
-      `
-      SELECT COALESCE(SUM(amount), 0) AS total_expenses
-      FROM personal_expenses
-      WHERE user_id = $1
-        AND expense_date >= $2::DATE
-        AND expense_date < $3::DATE
-      `,
-      [req.userId, monthStart, nextMonthStart]
-    );
-
-    // Actual EMI / loan / borrow repayments.
-    const repaymentResult = await db.query(
-      `
-      SELECT
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'EMI'
-          ),
-          0
-        ) AS loan_emi_paid,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Loan Repayment'
-          ),
-          0
-        ) AS loan_repayment,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE payment_type = 'Borrow Repayment'
-          ),
-          0
-        ) AS borrow_repayment
-
-      FROM personal_loan_emi_payments
-      WHERE user_id = $1
-        AND payment_date >= $2::DATE
-        AND payment_date < $3::DATE
-      `,
-      [req.userId, monthStart, nextMonthStart]
-    );
-
-    // Received payments.
-    const paymentResult = await db.query(
-      `
-      SELECT
-        COALESCE(SUM(amount), 0) AS total_received,
-
-        COALESCE(
-          SUM(amount) FILTER (WHERE category = 'Work'),
-          0
-        ) AS received_work,
-
-        COALESCE(
-          SUM(amount) FILTER (WHERE category = 'Business'),
-          0
-        ) AS received_business,
-
-        COALESCE(
-          SUM(amount) FILTER (WHERE category = 'Other'),
-          0
-        ) AS received_other
-
-      FROM personal_payments
-      WHERE user_id = $1
-        AND status = 'Received'
-        AND COALESCE(received_at::DATE, payment_date)
-              >= $2::DATE
-        AND COALESCE(received_at::DATE, payment_date)
-              < $3::DATE
-      `,
-      [req.userId, monthStart, nextMonthStart]
-    );
-
-    // Active/upcoming loans and borrowings.
-    const upcomingResult = await db.query(
-      `
-      SELECT
-        COUNT(*) FILTER (
-          WHERE type = 'Loan'
-        )::INTEGER AS active_loans,
-
-        COUNT(*) FILTER (
-          WHERE type = 'Borrow'
-        )::INTEGER AS active_borrows,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE type = 'Loan'
-          ),
-          0
-        ) AS total_loan_amount,
-
-        COALESCE(
-          SUM(amount) FILTER (
-            WHERE type = 'Borrow'
-          ),
-          0
-        ) AS total_borrow_amount,
-
-        MIN(end_date) FILTER (
-          WHERE type = 'Loan'
-            AND status = 'Active'
-            AND end_date >= CURRENT_DATE
-        ) AS next_loan_date,
-
-        MIN(return_date) FILTER (
-          WHERE type = 'Borrow'
-            AND status = 'Active'
-            AND return_date >= CURRENT_DATE
-        ) AS next_borrow_date
-
-      FROM personal_loans_borrow
-      WHERE user_id = $1
-        AND status = 'Active'
-      `,
-      [req.userId]
-    );
-
-    const manualOverview = manualOverviewResult.rows[0] || {
-      total_business: 0,
-      total_works: 0,
-      business_payment: 0,
-      work_payment: 0,
-    };
-
-    const expenses = expenseResult.rows[0];
-    const repayments = repaymentResult.rows[0];
-    const payments = paymentResult.rows[0];
-    const upcoming = upcomingResult.rows[0];
-
-    const totalBusiness = Number(manualOverview.total_business || 0);
-    const totalWorks = Number(manualOverview.total_works || 0);
-    const businessPayment = Number(manualOverview.business_payment || 0);
-    const workPayment = Number(manualOverview.work_payment || 0);
-
-    const receivedPayments = Number(payments.total_received || 0);
-
-    // Business/work amount can be configured as work/business income.
-    // Received payments are also included separately so the frontend can
-    // display both operational income and actual received cash.
-    const totalIncome =
-      receivedPayments > 0
-        ? receivedPayments
-        : businessPayment + workPayment;
-
-    const totalExpenses = Number(expenses.total_expenses || 0);
-
-    const loanEmiPaid = Number(repayments.loan_emi_paid || 0);
-    const loanRepayment = Number(repayments.loan_repayment || 0);
-    const borrowRepayment = Number(repayments.borrow_repayment || 0);
-
-    const totalOutgoing =
-      totalExpenses +
-      loanEmiPaid +
-      loanRepayment +
-      borrowRepayment;
-
-    const savings = totalIncome - totalOutgoing;
-
-    let financialStatus = "No Savings";
-
-    if (savings > 0) {
-      financialStatus = "Saved";
-    } else if (savings < 0) {
-      financialStatus = "Loss";
-    } else {
-      financialStatus = "No Savings";
-    }
-
-    if (totalIncome > totalOutgoing) {
-      financialStatus = "Profit";
-    }
-
-    const response = {
-      success: true,
-
-      data: {
-        month,
-
-        business: {
-          total: totalBusiness,
-          payment: businessPayment,
-        },
-
-        work: {
-          total: totalWorks,
-          payment: workPayment,
-        },
-
-        income: {
-          received: receivedPayments,
-          work_received: Number(payments.received_work || 0),
-          business_received: Number(payments.received_business || 0),
-          other_received: Number(payments.received_other || 0),
-          total: totalIncome,
-        },
-
-        expenses: {
-          total: totalExpenses,
-        },
-
-        loan: {
-          active_count: Number(upcoming.active_loans || 0),
-          total_amount: Number(upcoming.total_loan_amount || 0),
-          emi_paid: loanEmiPaid,
-          repayment_paid: loanRepayment,
-          next_due_date: upcoming.next_loan_date || null,
-        },
-
-        borrow: {
-          active_count: Number(upcoming.active_borrows || 0),
-          total_amount: Number(upcoming.total_borrow_amount || 0),
-          repayment_paid: borrowRepayment,
-          next_return_date: upcoming.next_borrow_date || null,
-        },
-
-        savings: {
-          total_income: totalIncome,
-          total_outgoing: totalOutgoing,
-          total: savings,
-          status: financialStatus,
-        },
-
-        other_income: {
-          received: Number(payments.received_other || 0),
-          exists: Number(payments.received_other || 0) > 0,
-        },
-
-        upcoming: {
-          active_loans: Number(upcoming.active_loans || 0),
-          active_borrows: Number(upcoming.active_borrows || 0),
-          next_loan_date: upcoming.next_loan_date || null,
-          next_borrow_return_date: upcoming.next_borrow_date || null,
-        },
-      },
-    };
-
-    return res.json(response);
-  } catch (error) {
-    console.error("❌ GET overview error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to load overview",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 2. CREATE BUSINESS / WORK
-// These records remain available for separate Business/Work management.
-// They do NOT override the 4 manual monthly overview values above.
-// POST /api/overview/business-work
-// ============================================================
-
-router.post("/business-work", authenticate, async (req, res) => {
-  try {
-    const {
-      name,
-      type,
-      status,
-      amount,
-      start_date,
-      end_date,
-      notes,
-    } = req.body;
-
-    const normalizedType = normalizeType(type);
-    const normalizedStatus = normalizeStatus(status);
-    const numericAmount =
-      amount === undefined || amount === null || amount === ""
-        ? 0
-        : parsePositiveNumber(amount);
-
-    if (!name || !String(name).trim()) {
-      return res.status(400).json({
-        success: false,
-        message: "Business/Work name is required",
-      });
-    }
-
-    if (!normalizedType) {
-      return res.status(400).json({
-        success: false,
-        message: "Type must be Business or Work",
-      });
-    }
-
-    if (!normalizedStatus) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status",
-      });
-    }
-
-    if (numericAmount === null) {
-      return res.status(400).json({
-        success: false,
-        message: "Amount must be a valid positive number",
-      });
-    }
-
-    if (start_date && !isValidDate(start_date)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid start date",
-      });
-    }
-
-    if (end_date && !isValidDate(end_date)) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid end date",
-      });
-    }
-
-    if (start_date && end_date && end_date < start_date) {
-      return res.status(400).json({
-        success: false,
-        message: "End date cannot be before start date",
-      });
-    }
-
-    const result = await db.query(
-      `
-      INSERT INTO personal_business_work (
-        user_id,
-        name,
-        type,
-        status,
-        amount,
-        start_date,
-        end_date,
-        notes
-      )
-      VALUES ($1,$2,$3,$4,$5,COALESCE($6::DATE,CURRENT_DATE),$7,$8)
-      RETURNING *
-      `,
-      [
-        req.userId,
-        String(name).trim(),
-        normalizedType,
-        normalizedStatus,
-        numericAmount,
-        start_date || null,
-        end_date || null,
-        notes || null,
-      ]
-    );
-
-    return res.status(201).json({
-      success: true,
-      message: `${normalizedType} added successfully`,
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Create business/work error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to add business/work",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 3. GET BUSINESS / WORK LIST
-// GET /api/overview/business-work?type=Business&status=Active
-// ============================================================
-
-router.get("/business-work", authenticate, async (req, res) => {
-  try {
-    const { type, status, month } = req.query;
-
-    const normalizedType = type ? normalizeType(type) : null;
-    const normalizedStatus = status ? normalizeStatus(status) : null;
-
-    if (type && !normalizedType) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid type",
-      });
-    }
-
-    if (status && !normalizedStatus) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid status",
-      });
-    }
-
-    let query = `
-      SELECT
-        id,
-        name,
-        type,
-        status,
-        amount,
-        start_date,
-        end_date,
-        notes,
-        created_at,
-        updated_at
-      FROM personal_business_work
-      WHERE user_id = $1
-    `;
-
-    const values = [req.userId];
-    let index = 2;
-
-    if (normalizedType) {
-      query += ` AND type = $${index}`;
-      values.push(normalizedType);
-      index++;
-    }
-
-    if (normalizedStatus) {
-      query += ` AND status = $${index}`;
-      values.push(normalizedStatus);
-      index++;
-    }
-
-    if (month) {
-      const range = getMonthRange(month);
-
-      if (!range) {
-        return res.status(400).json({
-          success: false,
-          message: "Invalid month. Use YYYY-MM.",
+// ==================== GET OVERVIEW - MAIN API ====================
+router.get("/", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const monthStr = req.query.month || formatMonthDisplay(getCurrentMonthStart());
+        
+        let monthStart;
+        try {
+            monthStart = parseMonthStart(monthStr);
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        // ============================================================
+        // 1. GET MANUAL DATA FROM OVERVIEW TABLE
+        // ============================================================
+        const overviewQuery = `
+            SELECT 
+                total_work,
+                total_business,
+                work_payment,
+                business_payment,
+                month_start
+            FROM personal_overview
+            WHERE user_id = $1 AND month_start = $2
+        `;
+        const overviewResult = await db.query(overviewQuery, [userId, monthStart]);
+        
+        let overview = {
+            total_work: 0,
+            total_business: 0,
+            work_payment: 0,
+            business_payment: 0,
+            month_start: monthStart,
+            month_display: formatMonthDisplay(monthStart)
+        };
+
+        if (overviewResult.rows.length > 0) {
+            overview = {
+                ...overviewResult.rows[0],
+                month_display: formatMonthDisplay(monthStart)
+            };
+        }
+
+        // ============================================================
+        // 2. GET TOTAL EXPENSES FROM EXPENSE PAGE
+        // ============================================================
+        const expenseQuery = `
+            SELECT COALESCE(SUM(amount), 0) as total_expenses
+            FROM personal_expenses
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', expense_date) = $2::DATE
+        `;
+        const expenseResult = await db.query(expenseQuery, [userId, monthStart]);
+        const totalExpenses = parseFloat(expenseResult.rows[0].total_expenses);
+
+        const expenseCountQuery = `
+            SELECT COUNT(*) as expense_count
+            FROM personal_expenses
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', expense_date) = $2::DATE
+        `;
+        const expenseCountResult = await db.query(expenseCountQuery, [userId, monthStart]);
+        const expenseCount = parseInt(expenseCountResult.rows[0].expense_count);
+
+        // ============================================================
+        // 3. GET TOTAL BORROW FROM LOANBORROW PAGE
+        // ============================================================
+        const borrowQuery = `
+            SELECT COALESCE(SUM(borrow_amount), 0) as total_borrow
+            FROM personal_borrow
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', take_date) = $2::DATE
+        `;
+        const borrowResult = await db.query(borrowQuery, [userId, monthStart]);
+        const totalBorrow = parseFloat(borrowResult.rows[0].total_borrow);
+
+        const borrowCountQuery = `
+            SELECT COUNT(*) as borrow_count
+            FROM personal_borrow
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', take_date) = $2::DATE
+        `;
+        const borrowCountResult = await db.query(borrowCountQuery, [userId, monthStart]);
+        const borrowCount = parseInt(borrowCountResult.rows[0].borrow_count);
+
+        // ============================================================
+        // 4. GET TOTAL EMI PAID FROM LOANBORROW PAGE
+        // ============================================================
+        const emiQuery = `
+            SELECT COALESCE(SUM(emi_amount), 0) as total_emi_paid
+            FROM personal_loan_emi_payments
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', payment_date) = $2::DATE
+        `;
+        const emiResult = await db.query(emiQuery, [userId, monthStart]);
+        const totalEmiPaid = parseFloat(emiResult.rows[0].total_emi_paid);
+
+        const emiCountQuery = `
+            SELECT COUNT(*) as emi_count
+            FROM personal_loan_emi_payments
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', payment_date) = $2::DATE
+        `;
+        const emiCountResult = await db.query(emiCountQuery, [userId, monthStart]);
+        const emiCount = parseInt(emiCountResult.rows[0].emi_count);
+
+        // ============================================================
+        // 5. GET TOTAL PAYMENT STATS FROM PAYMENT PAGE
+        // ============================================================
+        const paymentQuery = `
+            SELECT 
+                COALESCE(SUM(CASE WHEN status = 'received' THEN amount ELSE 0 END), 0) as total_received,
+                COALESCE(SUM(CASE WHEN status = 'pending' THEN amount ELSE 0 END), 0) as total_pending,
+                COALESCE(SUM(CASE WHEN status = 'overdue' THEN amount ELSE 0 END), 0) as total_overdue,
+                COALESCE(SUM(CASE WHEN status = 'lost' THEN amount ELSE 0 END), 0) as total_lost,
+                COALESCE(SUM(amount), 0) as total_payments
+            FROM personal_payments
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', payment_date) = $2::DATE
+        `;
+        const paymentResult = await db.query(paymentQuery, [userId, monthStart]);
+        
+        const totalReceived = parseFloat(paymentResult.rows[0].total_received);
+        const totalPending = parseFloat(paymentResult.rows[0].total_pending);
+        const totalOverdue = parseFloat(paymentResult.rows[0].total_overdue);
+        const totalLost = parseFloat(paymentResult.rows[0].total_lost);
+        const totalPayments = parseFloat(paymentResult.rows[0].total_payments);
+
+        const paymentCountQuery = `
+            SELECT 
+                status,
+                COUNT(*) as count
+            FROM personal_payments
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', payment_date) = $2::DATE
+            GROUP BY status
+        `;
+        const paymentCountResult = await db.query(paymentCountQuery, [userId, monthStart]);
+        
+        let paymentCounts = {
+            received: 0,
+            pending: 0,
+            overdue: 0,
+            lost: 0
+        };
+        
+        paymentCountResult.rows.forEach(row => {
+            if (row.status === 'received') paymentCounts.received = parseInt(row.count);
+            else if (row.status === 'pending') paymentCounts.pending = parseInt(row.count);
+            else if (row.status === 'overdue') paymentCounts.overdue = parseInt(row.count);
+            else if (row.status === 'lost') paymentCounts.lost = parseInt(row.count);
         });
-      }
 
-      query += `
-        AND start_date < $${index}::DATE
-        AND (
-          end_date IS NULL
-          OR end_date >= $${index + 1}::DATE
-        )
-      `;
+        // ============================================================
+        // 6. CALCULATE TOTALS
+        // ============================================================
+        const totalPayment = parseFloat(overview.work_payment) + parseFloat(overview.business_payment);
+        const monthlySaving = totalPayment - totalExpenses + totalEmiPaid;
 
-      values.push(range.nextMonthStart);
-      values.push(range.monthStart);
-      index += 2;
+        // ============================================================
+        // 7. GET ACTIVE BORROWS
+        // ============================================================
+        const activeBorrowQuery = `
+            SELECT 
+                b.id,
+                b.person_name,
+                b.borrow_amount,
+                b.return_date,
+                COALESCE(SUM(r.repayment_amount), 0) as total_repaid,
+                (b.borrow_amount - COALESCE(SUM(r.repayment_amount), 0)) as remaining_amount,
+                (b.return_date - CURRENT_DATE) as days_remaining
+            FROM personal_borrow b
+            LEFT JOIN personal_borrow_repayments r ON b.id = r.borrow_id
+            WHERE b.user_id = $1 AND b.status = 'active'
+            GROUP BY b.id
+            ORDER BY b.return_date ASC
+            LIMIT 5
+        `;
+        const activeBorrowResult = await db.query(activeBorrowQuery, [userId]);
+
+        // ============================================================
+        // 8. GET ACTIVE LOANS
+        // ============================================================
+        const activeLoanQuery = `
+            SELECT 
+                l.id,
+                l.bank_name,
+                l.total_loan_amount,
+                l.emi_amount,
+                l.total_emis,
+                l.next_emi_date,
+                COUNT(e.id) as paid_emis,
+                (l.total_emis - COUNT(e.id)) as remaining_emis,
+                (l.next_emi_date - CURRENT_DATE) as days_until_next_emi
+            FROM personal_loans l
+            LEFT JOIN personal_loan_emi_payments e ON l.id = e.loan_id
+            WHERE l.user_id = $1 AND l.status = 'active'
+            GROUP BY l.id
+            ORDER BY l.next_emi_date ASC
+            LIMIT 5
+        `;
+        const activeLoanResult = await db.query(activeLoanQuery, [userId]);
+
+        // ============================================================
+        // 9. GET OVERDUE PAYMENTS
+        // ============================================================
+        const overduePaymentsQuery = `
+            SELECT 
+                id,
+                person_name,
+                amount,
+                payment_date,
+                (CURRENT_DATE - payment_date) as days_late
+            FROM personal_payments
+            WHERE user_id = $1 
+            AND status = 'overdue'
+            ORDER BY payment_date ASC
+            LIMIT 5
+        `;
+        const overduePaymentsResult = await db.query(overduePaymentsQuery, [userId]);
+
+        // ============================================================
+        // 10. GET PENDING PAYMENTS
+        // ============================================================
+        const pendingPaymentsQuery = `
+            SELECT 
+                id,
+                person_name,
+                amount,
+                payment_date,
+                (CURRENT_DATE - payment_date) as days_late
+            FROM personal_payments
+            WHERE user_id = $1 
+            AND status = 'pending'
+            AND DATE_TRUNC('month', payment_date) = $2::DATE
+            ORDER BY payment_date ASC
+            LIMIT 5
+        `;
+        const pendingPaymentsResult = await db.query(pendingPaymentsQuery, [userId, monthStart]);
+
+        // ============================================================
+        // 11. GET RECENT EXPENSES
+        // ============================================================
+        const recentExpensesQuery = `
+            SELECT 
+                e.id,
+                e.amount,
+                e.expense_date,
+                e.notes,
+                c.category_name,
+                c.icon,
+                c.color
+            FROM personal_expenses e
+            JOIN personal_expense_categories c ON e.category_id = c.id
+            WHERE e.user_id = $1 
+            AND DATE_TRUNC('month', e.expense_date) = $2::DATE
+            ORDER BY e.expense_date DESC
+            LIMIT 5
+        `;
+        const recentExpensesResult = await db.query(recentExpensesQuery, [userId, monthStart]);
+
+        // ============================================================
+        // 12. GET CATEGORY BREAKDOWN
+        // ============================================================
+        const categoryQuery = `
+            SELECT 
+                c.id as category_id,
+                c.category_name,
+                c.icon,
+                c.color,
+                COUNT(e.id) as expense_count,
+                COALESCE(SUM(e.amount), 0) as total_amount
+            FROM personal_expense_categories c
+            LEFT JOIN personal_expenses e 
+                ON e.category_id = c.id 
+                AND e.user_id = $1 
+                AND DATE_TRUNC('month', e.expense_date) = $2::DATE
+            WHERE c.user_id = $1
+            GROUP BY c.id, c.category_name, c.icon, c.color
+            ORDER BY total_amount DESC
+        `;
+        const categoryResult = await db.query(categoryQuery, [userId, monthStart]);
+
+        // ============================================================
+        // 13. GET WEEKLY BREAKDOWN
+        // ============================================================
+        const weekQuery = `
+            SELECT 
+                CASE 
+                    WHEN EXTRACT(DAY FROM expense_date) BETWEEN 1 AND 7 THEN 1
+                    WHEN EXTRACT(DAY FROM expense_date) BETWEEN 8 AND 14 THEN 2
+                    WHEN EXTRACT(DAY FROM expense_date) BETWEEN 15 AND 21 THEN 3
+                    ELSE 4
+                END as week_number,
+                COUNT(*) as expense_count,
+                COALESCE(SUM(amount), 0) as total_amount
+            FROM personal_expenses
+            WHERE user_id = $1 
+            AND DATE_TRUNC('month', expense_date) = $2::DATE
+            GROUP BY week_number
+            ORDER BY week_number
+        `;
+        const weekResult = await db.query(weekQuery, [userId, monthStart]);
+
+        // ============================================================
+        // 14. SEND RESPONSE
+        // ============================================================
+        res.json({
+            success: true,
+            data: {
+                month: {
+                    start: monthStart,
+                    display: formatMonthDisplay(monthStart)
+                },
+                manual_data: {
+                    total_work: parseInt(overview.total_work),
+                    total_business: parseInt(overview.total_business),
+                    work_payment: parseFloat(overview.work_payment),
+                    business_payment: parseFloat(overview.business_payment)
+                },
+                calculated: {
+                    total_payment: totalPayment,
+                    total_expenses: totalExpenses,
+                    total_borrow: totalBorrow,
+                    total_emi_paid: totalEmiPaid,
+                    monthly_saving: monthlySaving
+                },
+                expense_summary: {
+                    total: totalExpenses,
+                    count: expenseCount,
+                    recent: recentExpensesResult.rows.map(row => ({
+                        ...row,
+                        amount: parseFloat(row.amount),
+                        expense_date: formatDate(row.expense_date)
+                    })),
+                    category_breakdown: categoryResult.rows.map(row => ({
+                        ...row,
+                        total_amount: parseFloat(row.total_amount),
+                        expense_count: parseInt(row.expense_count)
+                    })),
+                    weekly_breakdown: weekResult.rows.map(row => ({
+                        week_number: parseInt(row.week_number),
+                        expense_count: parseInt(row.expense_count),
+                        total_amount: parseFloat(row.total_amount)
+                    }))
+                },
+                borrow_summary: {
+                    total: totalBorrow,
+                    count: borrowCount,
+                    active: activeBorrowResult.rows.map(row => ({
+                        ...row,
+                        borrow_amount: parseFloat(row.borrow_amount),
+                        total_repaid: parseFloat(row.total_repaid),
+                        remaining_amount: parseFloat(row.remaining_amount),
+                        return_date: formatDate(row.return_date),
+                        days_remaining: parseInt(row.days_remaining) || 0
+                    }))
+                },
+                emi_summary: {
+                    total_paid: totalEmiPaid,
+                    count: emiCount,
+                    active_loans: activeLoanResult.rows.map(row => ({
+                        ...row,
+                        total_loan_amount: parseFloat(row.total_loan_amount),
+                        emi_amount: parseFloat(row.emi_amount),
+                        paid_emis: parseInt(row.paid_emis),
+                        remaining_emis: parseInt(row.remaining_emis),
+                        next_emi_date: formatDate(row.next_emi_date),
+                        days_until_next_emi: parseInt(row.days_until_next_emi) || 0
+                    }))
+                },
+                payment_summary: {
+                    totals: {
+                        received: totalReceived,
+                        pending: totalPending,
+                        overdue: totalOverdue,
+                        lost: totalLost,
+                        total: totalPayments
+                    },
+                    counts: paymentCounts,
+                    overdue_payments: overduePaymentsResult.rows.map(row => ({
+                        ...row,
+                        amount: parseFloat(row.amount),
+                        payment_date: formatDate(row.payment_date),
+                        days_late: parseInt(row.days_late)
+                    })),
+                    pending_payments: pendingPaymentsResult.rows.map(row => ({
+                        ...row,
+                        amount: parseFloat(row.amount),
+                        payment_date: formatDate(row.payment_date),
+                        days_late: parseInt(row.days_late)
+                    }))
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error("Error fetching overview:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    query += " ORDER BY start_date DESC, id DESC";
-
-    const result = await db.query(query, values);
-
-    return res.json({
-      success: true,
-      count: result.rows.length,
-      data: result.rows,
-    });
-  } catch (error) {
-    console.error("❌ Get business/work error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch business/work",
-      error: error.message,
-    });
-  }
 });
 
-// ============================================================
-// 4. GET SINGLE BUSINESS / WORK
-// GET /api/overview/business-work/:id
-// ============================================================
+// ==================== CREATE OR UPDATE OVERVIEW ====================
+router.post("/", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { 
+            month_start,
+            total_work = 0,
+            total_business = 0,
+            work_payment = 0,
+            business_payment = 0
+        } = req.body;
 
-router.get("/business-work/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+        if (!month_start) {
+            return res.status(400).json({ error: "month_start is required" });
+        }
 
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid business/work ID",
-      });
+        let monthStart;
+        try {
+            monthStart = parseMonthStart(month_start);
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        if (total_work < 0 || total_business < 0 || work_payment < 0 || business_payment < 0) {
+            return res.status(400).json({ error: "All values must be >= 0" });
+        }
+
+        const query = `
+            INSERT INTO personal_overview (
+                user_id,
+                month_start,
+                total_work,
+                total_business,
+                work_payment,
+                business_payment
+            ) VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (user_id, month_start) 
+            DO UPDATE SET
+                total_work = EXCLUDED.total_work,
+                total_business = EXCLUDED.total_business,
+                work_payment = EXCLUDED.work_payment,
+                business_payment = EXCLUDED.business_payment,
+                updated_at = CURRENT_TIMESTAMP
+            RETURNING *
+        `;
+
+        const result = await db.query(query, [
+            userId,
+            monthStart,
+            total_work,
+            total_business,
+            work_payment,
+            business_payment
+        ]);
+
+        res.json({
+            success: true,
+            message: "Overview saved successfully",
+            data: {
+                ...result.rows[0],
+                month_display: formatMonthDisplay(monthStart),
+                total_work: parseInt(result.rows[0].total_work),
+                total_business: parseInt(result.rows[0].total_business),
+                work_payment: parseFloat(result.rows[0].work_payment),
+                business_payment: parseFloat(result.rows[0].business_payment)
+            }
+        });
+
+    } catch (error) {
+        console.error("Error saving overview:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    const result = await db.query(
-      `
-      SELECT *
-      FROM personal_business_work
-      WHERE id = $1
-        AND user_id = $2
-      `,
-      [id, req.userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Business/Work not found",
-      });
-    }
-
-    return res.json({
-      success: true,
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Get single business/work error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch business/work",
-      error: error.message,
-    });
-  }
 });
 
-// ============================================================
-// 5. UPDATE BUSINESS / WORK
-// PUT /api/overview/business-work/:id
-// ============================================================
+// ==================== UPDATE OVERVIEW ====================
+router.put("/", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const { 
+            month_start,
+            total_work,
+            total_business,
+            work_payment,
+            business_payment
+        } = req.body;
 
-router.put("/business-work/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+        if (!month_start) {
+            return res.status(400).json({ error: "month_start is required" });
+        }
 
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid business/work ID",
-      });
+        let monthStart;
+        try {
+            monthStart = parseMonthStart(month_start);
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        const updates = [];
+        const values = [];
+        let paramCount = 1;
+
+        if (total_work !== undefined) {
+            if (total_work < 0) return res.status(400).json({ error: "total_work must be >= 0" });
+            updates.push(`total_work = $${paramCount}`);
+            values.push(total_work);
+            paramCount++;
+        }
+
+        if (total_business !== undefined) {
+            if (total_business < 0) return res.status(400).json({ error: "total_business must be >= 0" });
+            updates.push(`total_business = $${paramCount}`);
+            values.push(total_business);
+            paramCount++;
+        }
+
+        if (work_payment !== undefined) {
+            if (work_payment < 0) return res.status(400).json({ error: "work_payment must be >= 0" });
+            updates.push(`work_payment = $${paramCount}`);
+            values.push(work_payment);
+            paramCount++;
+        }
+
+        if (business_payment !== undefined) {
+            if (business_payment < 0) return res.status(400).json({ error: "business_payment must be >= 0" });
+            updates.push(`business_payment = $${paramCount}`);
+            values.push(business_payment);
+            paramCount++;
+        }
+
+        if (updates.length === 0) {
+            return res.status(400).json({ error: "No fields to update" });
+        }
+
+        updates.push(`updated_at = CURRENT_TIMESTAMP`);
+        values.push(userId, monthStart);
+
+        const query = `
+            UPDATE personal_overview
+            SET ${updates.join(', ')}
+            WHERE user_id = $${paramCount} AND month_start = $${paramCount + 1}
+            RETURNING *
+        `;
+
+        const result = await db.query(query, values);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Overview not found for this month" });
+        }
+
+        res.json({
+            success: true,
+            message: "Overview updated successfully",
+            data: {
+                ...result.rows[0],
+                month_display: formatMonthDisplay(monthStart),
+                total_work: parseInt(result.rows[0].total_work),
+                total_business: parseInt(result.rows[0].total_business),
+                work_payment: parseFloat(result.rows[0].work_payment),
+                business_payment: parseFloat(result.rows[0].business_payment)
+            }
+        });
+
+    } catch (error) {
+        console.error("Error updating overview:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    const existing = await db.query(
-      `
-      SELECT *
-      FROM personal_business_work
-      WHERE id = $1
-        AND user_id = $2
-      `,
-      [id, req.userId]
-    );
-
-    if (existing.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Business/Work not found",
-      });
-    }
-
-    const old = existing.rows[0];
-
-    const {
-      name,
-      type,
-      status,
-      amount,
-      start_date,
-      end_date,
-      notes,
-    } = req.body;
-
-    const finalName =
-      name !== undefined ? String(name).trim() : old.name;
-
-    const finalType =
-      type !== undefined ? normalizeType(type) : old.type;
-
-    const finalStatus =
-      status !== undefined ? normalizeStatus(status) : old.status;
-
-    const finalAmount =
-      amount !== undefined
-        ? parsePositiveNumber(amount)
-        : Number(old.amount);
-
-    const finalStartDate =
-      start_date !== undefined ? start_date : old.start_date;
-
-    const finalEndDate =
-      end_date !== undefined ? end_date : old.end_date;
-
-    const finalNotes =
-      notes !== undefined ? notes : old.notes;
-
-    if (!finalName) {
-      return res.status(400).json({
-        success: false,
-        message: "Name is required",
-      });
-    }
-
-    if (!finalType || !finalStatus) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid type or status",
-      });
-    }
-
-    if (finalAmount === null || finalAmount < 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid amount",
-      });
-    }
-
-    if (!isValidDate(String(finalStartDate))) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid start date",
-      });
-    }
-
-    if (
-      finalEndDate !== null &&
-      finalEndDate !== undefined &&
-      !isValidDate(String(finalEndDate))
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid end date",
-      });
-    }
-
-    if (
-      finalEndDate &&
-      String(finalEndDate) < String(finalStartDate)
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "End date cannot be before start date",
-      });
-    }
-
-    const result = await db.query(
-      `
-      UPDATE personal_business_work
-      SET
-        name = $1,
-        type = $2,
-        status = $3,
-        amount = $4,
-        start_date = $5,
-        end_date = $6,
-        notes = $7,
-        updated_at = CURRENT_TIMESTAMP
-      WHERE id = $8
-        AND user_id = $9
-      RETURNING *
-      `,
-      [
-        finalName,
-        finalType,
-        finalStatus,
-        finalAmount,
-        finalStartDate,
-        finalEndDate || null,
-        finalNotes || null,
-        id,
-        req.userId,
-      ]
-    );
-
-    return res.json({
-      success: true,
-      message: "Business/Work updated successfully",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Update business/work error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update business/work",
-      error: error.message,
-    });
-  }
 });
 
-// ============================================================
-// 6. DELETE BUSINESS / WORK
-// DELETE /api/overview/business-work/:id
-// ============================================================
+// ==================== DELETE OVERVIEW ====================
+router.delete("/", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const monthStr = req.query.month;
 
-router.delete("/business-work/:id", authenticate, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+        if (!monthStr) {
+            return res.status(400).json({ error: "month parameter is required" });
+        }
 
-    if (!Number.isInteger(id) || id <= 0) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid business/work ID",
-      });
+        let monthStart;
+        try {
+            monthStart = parseMonthStart(monthStr);
+        } catch (error) {
+            return res.status(400).json({ error: error.message });
+        }
+
+        const query = `
+            DELETE FROM personal_overview
+            WHERE user_id = $1 AND month_start = $2
+            RETURNING *
+        `;
+
+        const result = await db.query(query, [userId, monthStart]);
+
+        if (result.rows.length === 0) {
+            return res.status(404).json({ error: "Overview not found for this month" });
+        }
+
+        res.json({
+            success: true,
+            message: `Overview for ${formatMonthDisplay(monthStart)} deleted successfully`,
+            data: {
+                ...result.rows[0],
+                month_display: formatMonthDisplay(monthStart),
+                total_work: parseInt(result.rows[0].total_work),
+                total_business: parseInt(result.rows[0].total_business),
+                work_payment: parseFloat(result.rows[0].work_payment),
+                business_payment: parseFloat(result.rows[0].business_payment)
+            }
+        });
+
+    } catch (error) {
+        console.error("Error deleting overview:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    const result = await db.query(
-      `
-      DELETE FROM personal_business_work
-      WHERE id = $1
-        AND user_id = $2
-      RETURNING id, name, type
-      `,
-      [id, req.userId]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Business/Work not found",
-      });
-    }
-
-    return res.json({
-      success: true,
-      message: "Business/Work deleted successfully",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Delete business/work error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to delete business/work",
-      error: error.message,
-    });
-  }
 });
 
-// ============================================================
-// 7. UPDATE MONTHLY OVERVIEW MANUAL VALUES
-// PUT /api/overview/month
-//
-// Use this only for monthly overview values that are not derived
-// from Business/Work records. Financial totals remain calculated
-// from the actual financial tables.
-// ============================================================
+// ==================== GET ALL MONTHS ====================
+router.get("/months", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
 
-router.put("/month", authenticate, async (req, res) => {
-  try {
-    const {
-      month,
-      total_business,
-      total_works,
-      business_payment,
-      work_payment,
-    } = req.body;
+        const query = `
+            SELECT 
+                month_start,
+                total_work,
+                total_business,
+                work_payment,
+                business_payment,
+                created_at,
+                updated_at
+            FROM personal_overview
+            WHERE user_id = $1
+            ORDER BY month_start DESC
+        `;
 
-    const selectedMonth = month || getCurrentMonth();
-    const range = getMonthRange(selectedMonth);
+        const result = await db.query(query, [userId]);
 
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
+        const months = result.rows.map(row => ({
+            ...row,
+            month_display: formatMonthDisplay(row.month_start),
+            total_work: parseInt(row.total_work),
+            total_business: parseInt(row.total_business),
+            work_payment: parseFloat(row.work_payment),
+            business_payment: parseFloat(row.business_payment),
+            total_payment: parseFloat(row.work_payment) + parseFloat(row.business_payment)
+        }));
+
+        res.json({
+            success: true,
+            count: months.length,
+            data: months
+        });
+
+    } catch (error) {
+        console.error("Error fetching months:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    const businessCount = Number(total_business ?? 0);
-    const workCount = Number(total_works ?? 0);
-    const businessAmount = Number(business_payment ?? 0);
-    const workAmount = Number(work_payment ?? 0);
-
-    if (
-      !Number.isInteger(businessCount) ||
-      businessCount < 0 ||
-      !Number.isInteger(workCount) ||
-      workCount < 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Business/work totals must be valid non-negative integers",
-      });
-    }
-
-    if (
-      !Number.isFinite(businessAmount) ||
-      businessAmount < 0 ||
-      !Number.isFinite(workAmount) ||
-      workAmount < 0
-    ) {
-      return res.status(400).json({
-        success: false,
-        message: "Payment totals must be valid non-negative numbers",
-      });
-    }
-
-    const result = await db.query(
-      `
-      INSERT INTO personal_overview (
-        user_id,
-        month_start,
-        total_business,
-        total_works,
-        business_payment,
-        work_payment
-      )
-      VALUES ($1,$2::DATE,$3,$4,$5,$6)
-      ON CONFLICT (user_id, month_start)
-      DO UPDATE SET
-        total_business = EXCLUDED.total_business,
-        total_works = EXCLUDED.total_works,
-        business_payment = EXCLUDED.business_payment,
-        work_payment = EXCLUDED.work_payment,
-        updated_at = CURRENT_TIMESTAMP
-      RETURNING *
-      `,
-      [
-        req.userId,
-        range.monthStart,
-        businessCount,
-        workCount,
-        businessAmount,
-        workAmount,
-      ]
-    );
-
-    return res.json({
-      success: true,
-      message: "Monthly overview updated successfully",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Update monthly overview error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to update monthly overview",
-      error: error.message,
-    });
-  }
 });
 
-// ============================================================
-// 8. GET MONTHLY BUSINESS / WORK SUMMARY
-// GET /api/overview/monthly-summary?month=2026-08
-// ============================================================
+// ==================== GET DASHBOARD ====================
+router.get("/dashboard", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const currentMonth = getCurrentMonthStart();
 
-router.get("/monthly-summary", authenticate, async (req, res) => {
-  try {
-    const month = req.query.month || getCurrentMonth();
-    const range = getMonthRange(month);
+        const allTimeQuery = `
+            SELECT 
+                (SELECT COALESCE(SUM(work_payment + business_payment), 0) FROM personal_overview WHERE user_id = $1) as total_payment,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_expenses WHERE user_id = $1) as total_expenses,
+                (SELECT COALESCE(SUM(borrow_amount), 0) FROM personal_borrow WHERE user_id = $1) as total_borrow,
+                (SELECT COALESCE(SUM(emi_amount), 0) FROM personal_loan_emi_payments WHERE user_id = $1) as total_emi_paid,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_payments WHERE user_id = $1 AND status = 'received') as total_received,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_payments WHERE user_id = $1 AND status = 'pending') as total_pending,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_payments WHERE user_id = $1 AND status = 'overdue') as total_overdue,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_payments WHERE user_id = $1 AND status = 'lost') as total_lost
+        `;
+        const allTimeResult = await db.query(allTimeQuery, [userId]);
 
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
+        const currentMonthQuery = `
+            SELECT 
+                (SELECT COALESCE(SUM(work_payment + business_payment), 0) FROM personal_overview WHERE user_id = $1 AND month_start = $2) as total_payment,
+                (SELECT COALESCE(SUM(amount), 0) FROM personal_expenses WHERE user_id = $1 AND DATE_TRUNC('month', expense_date) = $2::DATE) as total_expenses,
+                (SELECT COALESCE(SUM(borrow_amount), 0) FROM personal_borrow WHERE user_id = $1 AND DATE_TRUNC('month', take_date) = $2::DATE) as total_borrow,
+                (SELECT COALESCE(SUM(emi_amount), 0) FROM personal_loan_emi_payments WHERE user_id = $1 AND DATE_TRUNC('month', payment_date) = $2::DATE) as total_emi_paid
+        `;
+        const currentMonthResult = await db.query(currentMonthQuery, [userId, currentMonth]);
+
+        const allTimeSavings = parseFloat(allTimeResult.rows[0].total_payment) 
+            - parseFloat(allTimeResult.rows[0].total_expenses) 
+            + parseFloat(allTimeResult.rows[0].total_emi_paid);
+
+        const currentMonthSavings = parseFloat(currentMonthResult.rows[0].total_payment) 
+            - parseFloat(currentMonthResult.rows[0].total_expenses) 
+            + parseFloat(currentMonthResult.rows[0].total_emi_paid);
+
+        res.json({
+            success: true,
+            data: {
+                current_month: {
+                    display: formatMonthDisplay(currentMonth),
+                    start: currentMonth,
+                    total_payment: parseFloat(currentMonthResult.rows[0].total_payment),
+                    total_expenses: parseFloat(currentMonthResult.rows[0].total_expenses),
+                    total_borrow: parseFloat(currentMonthResult.rows[0].total_borrow),
+                    total_emi_paid: parseFloat(currentMonthResult.rows[0].total_emi_paid),
+                    savings: currentMonthSavings
+                },
+                all_time: {
+                    total_payment: parseFloat(allTimeResult.rows[0].total_payment),
+                    total_expenses: parseFloat(allTimeResult.rows[0].total_expenses),
+                    total_borrow: parseFloat(allTimeResult.rows[0].total_borrow),
+                    total_emi_paid: parseFloat(allTimeResult.rows[0].total_emi_paid),
+                    total_received: parseFloat(allTimeResult.rows[0].total_received),
+                    total_pending: parseFloat(allTimeResult.rows[0].total_pending),
+                    total_overdue: parseFloat(allTimeResult.rows[0].total_overdue),
+                    total_lost: parseFloat(allTimeResult.rows[0].total_lost),
+                    savings: allTimeSavings
+                }
+            }
+        });
+
+    } catch (error) {
+        console.error("Error fetching dashboard stats:", error);
+        res.status(500).json({ error: "Internal server error" });
     }
-
-    const result = await db.query(
-      `
-      SELECT
-        type,
-        COUNT(*)::INTEGER AS total_records,
-        COUNT(*) FILTER (WHERE status = 'Active')::INTEGER AS active_records,
-        COUNT(*) FILTER (WHERE status = 'Completed')::INTEGER AS completed_records,
-        COUNT(*) FILTER (WHERE status = 'Paused')::INTEGER AS paused_records,
-        COALESCE(SUM(amount), 0) AS total_amount
-      FROM personal_business_work
-      WHERE user_id = $1
-        AND start_date < $2::DATE
-        AND (
-          end_date IS NULL
-          OR end_date >= $3::DATE
-        )
-      GROUP BY type
-      ORDER BY type
-      `,
-      [req.userId, range.nextMonthStart, range.monthStart]
-    );
-
-    return res.json({
-      success: true,
-      month,
-      data: result.rows,
-    });
-  } catch (error) {
-    console.error("❌ Monthly overview summary error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch monthly overview summary",
-      error: error.message,
-    });
-  }
 });
-
-// ============================================================
-// 9. GET UPCOMING LOANS / BORROWS
-// GET /api/overview/upcoming
-//
-// Used by Overview to show future repayments/returns.
-// ============================================================
-
-router.get("/upcoming", authenticate, async (req, res) => {
-  try {
-    const result = await db.query(
-      `
-      SELECT
-        id,
-        name,
-        type,
-        amount,
-        emi,
-        start_date,
-        end_date,
-        return_date,
-        status,
-        notes,
-
-        CASE
-          WHEN type = 'Loan' THEN end_date
-          ELSE return_date
-        END AS due_date,
-
-        CASE
-          WHEN type = 'Loan' THEN
-            GREATEST(
-              0,
-              (end_date - CURRENT_DATE)
-            )
-          ELSE
-            GREATEST(
-              0,
-              (return_date - CURRENT_DATE)
-            )
-        END AS remaining_days
-
-      FROM personal_loans_borrow
-      WHERE user_id = $1
-        AND status = 'Active'
-        AND (
-          (type = 'Loan' AND end_date >= CURRENT_DATE)
-          OR
-          (type = 'Borrow' AND return_date >= CURRENT_DATE)
-        )
-      ORDER BY due_date ASC, id ASC
-      `,
-      [req.userId]
-    );
-
-    return res.json({
-      success: true,
-      count: result.rows.length,
-      data: result.rows,
-    });
-  } catch (error) {
-    console.error("❌ Upcoming loan/borrow error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to fetch upcoming loan/borrow records",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// 10. DELETE MONTHLY OVERVIEW
-// DELETE /api/overview/month/:month
-// ============================================================
-
-router.delete("/month/:month", authenticate, async (req, res) => {
-  try {
-    const range = getMonthRange(req.params.month);
-
-    if (!range) {
-      return res.status(400).json({
-        success: false,
-        message: "Invalid month. Use YYYY-MM.",
-      });
-    }
-
-    const result = await db.query(
-      `
-      DELETE FROM personal_overview
-      WHERE user_id = $1
-        AND month_start = $2::DATE
-      RETURNING *
-      `,
-      [req.userId, range.monthStart]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: "Monthly overview not found",
-      });
-    }
-
-    return res.json({
-      success: true,
-      message: "Monthly overview deleted successfully",
-      data: result.rows[0],
-    });
-  } catch (error) {
-    console.error("❌ Delete monthly overview error:", error);
-
-    return res.status(500).json({
-      success: false,
-      message: "Failed to delete monthly overview",
-      error: error.message,
-    });
-  }
-});
-
-// ============================================================
-// EXPORT
-// ============================================================
 
 module.exports = router;
