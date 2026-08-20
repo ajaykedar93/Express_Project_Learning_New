@@ -16,11 +16,9 @@ const expenseRoutes = require("./routes/expenseapi");
 const loanBorrowRoutes = require("./routes/loanBorrowapi");
 const paymentRoutes = require("./routes/paymentapi");
 
-
+const exportDetailsRouter = require("./routes/export_details");
 // To this:
 const performanceRoutes = require("./routes/all_performance");
-
-const exportDetailsRoutes = require("./routes/exportDetailsapi");
 
 const personalTradingRoutes = require("./routes/personal_trading");
 
@@ -157,11 +155,8 @@ app.use("/api/payments", paymentRoutes);
 app.use("/api/performance", performanceRoutes);
 
 
+app.use("/api/export-details", exportDetailsRouter);
 
-app.use(
-    "/api/export-details",
-    exportDetailsRoutes
-);
 
 // Personal Trading
 app.use(
