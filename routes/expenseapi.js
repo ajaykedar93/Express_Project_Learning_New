@@ -24,12 +24,31 @@ const authenticateToken = (req, res, next) => {
 // ==================== HELPER FUNCTIONS ====================
 // Get first day of month from date string (e.g., "1 Jan 2026" -> "2026-01-01")
 const parseMonthStart = (monthStr) => {
-    const date = new Date(monthStr);
-    if (isNaN(date.getTime())) {
-        throw new Error("Invalid date format. Use '1 Jan 2026'");
+    if (!monthStr) {
+        return getCurrentMonthStart();
     }
+
+    if (/^\d{4}-\d{2}$/.test(monthStr)) {
+        const [year, month] = monthStr.split("-").map(Number);
+
+        if (month < 1 || month > 12) {
+            throw new Error("Invalid month.");
+        }
+
+        return `${year}-${String(month).padStart(2, "0")}-01`;
+    }
+
+    const date = new Date(monthStr);
+
+    if (Number.isNaN(date.getTime())) {
+        throw new Error(
+            "Invalid date format. Use YYYY-MM or a valid date."
+        );
+    }
+
     const year = date.getFullYear();
-    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+
     return `${year}-${month}-01`;
 };
 
@@ -61,23 +80,20 @@ const formatDate = (date) => {
 
 // ==================== CATEGORY APIs ====================
 
-// GET - Get all categories for user
+// GET - Get all categories for the logged-in user
 router.get("/categories", authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
 
         const query = `
-            SELECT 
+            SELECT
                 id,
                 category_name,
-                icon,
-                color,
                 is_default,
-                created_at,
-                updated_at
+                created_at
             FROM personal_expense_categories
             WHERE user_id = $1
-            ORDER BY category_name ASC
+            ORDER BY is_default DESC, category_name ASC
         `;
 
         const result = await db.query(query, [userId]);
@@ -85,177 +101,214 @@ router.get("/categories", authenticateToken, async (req, res) => {
         res.json({
             success: true,
             count: result.rows.length,
-            data: result.rows
+            data: result.rows.map((row) => ({
+                ...row,
+                // Keep the frontend compatible even when icon/color
+                // columns are not present in the database.
+                icon: "📊",
+                color: "#3B82F6",
+            })),
         });
-
     } catch (error) {
         console.error("Error fetching categories:", error);
-        res.status(500).json({ error: "Internal server error" });
+
+        res.status(500).json({
+            error: error.message || "Internal server error",
+        });
     }
 });
 
-// POST - Add new category
+// POST - Add a new custom category
 router.post("/categories", authenticateToken, async (req, res) => {
     try {
         const userId = req.user.id;
-        const { category_name, icon = '📊', color = '#3B82F6' } = req.body;
 
-        if (!category_name || category_name.trim() === '') {
-            return res.status(400).json({ error: "Category name is required" });
-        }
+        const categoryName =
+            typeof req.body?.category_name === "string"
+                ? req.body.category_name.trim()
+                : "";
 
-        // Check if category already exists
-        const checkQuery = `
-            SELECT id FROM personal_expense_categories
-            WHERE user_id = $1 AND LOWER(category_name) = LOWER($2)
-        `;
-        const checkResult = await db.query(checkQuery, [userId, category_name.trim()]);
-
-        if (checkResult.rows.length > 0) {
-            return res.status(400).json({ error: "Category already exists" });
-        }
-
-        const query = `
-            INSERT INTO personal_expense_categories (
-                user_id,
-                category_name,
-                icon,
-                color
-            ) VALUES ($1, $2, $3, $4)
-            RETURNING *
-        `;
-
-        const result = await db.query(query, [
-            userId,
-            category_name.trim(),
-            icon,
-            color
-        ]);
-
-        res.json({
-            success: true,
-            message: "Category added successfully",
-            data: result.rows[0]
-        });
-
-    } catch (error) {
-        console.error("Error adding category:", error);
-        res.status(500).json({ error: "Internal server error" });
-    }
-});
-
-// PUT - Update category
-router.put("/categories/:id", authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const categoryId = req.params.id;
-        const { category_name, icon, color } = req.body;
-
-        if (!category_name || category_name.trim() === '') {
-            return res.status(400).json({ error: "Category name is required" });
-        }
-
-        // Check if category exists and belongs to user
-        const checkQuery = `
-            SELECT id, is_default FROM personal_expense_categories
-            WHERE id = $1 AND user_id = $2
-        `;
-        const checkResult = await db.query(checkQuery, [categoryId, userId]);
-
-        if (checkResult.rows.length === 0) {
-            return res.status(404).json({ error: "Category not found" });
-        }
-
-        // Don't allow editing default categories
-        if (checkResult.rows[0].is_default) {
-            return res.status(400).json({ error: "Cannot edit default categories" });
-        }
-
-        const query = `
-            UPDATE personal_expense_categories
-            SET 
-                category_name = $1,
-                icon = COALESCE($2, icon),
-                color = COALESCE($3, color),
-                updated_at = CURRENT_TIMESTAMP
-            WHERE id = $4 AND user_id = $5
-            RETURNING *
-        `;
-
-        const result = await db.query(query, [
-            category_name.trim(),
-            icon,
-            color,
-            categoryId,
-            userId
-        ]);
-
-        res.json({
-            success: true,
-            message: "Category updated successfully",
-            data: result.rows[0]
-        });
-
-    } catch (error) {
-        console.error("Error updating category:", error);
-        res.status(500).json({ error: "Internal server error" });
-    }
-});
-
-// DELETE - Delete category (only if not used)
-router.delete("/categories/:id", authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.id;
-        const categoryId = req.params.id;
-
-        // Check if category exists and belongs to user
-        const checkQuery = `
-            SELECT id, is_default FROM personal_expense_categories
-            WHERE id = $1 AND user_id = $2
-        `;
-        const checkResult = await db.query(checkQuery, [categoryId, userId]);
-
-        if (checkResult.rows.length === 0) {
-            return res.status(404).json({ error: "Category not found" });
-        }
-
-        // Don't allow deleting default categories
-        if (checkResult.rows[0].is_default) {
-            return res.status(400).json({ error: "Cannot delete default categories" });
-        }
-
-        // Check if category is used in expenses
-        const usageQuery = `
-            SELECT COUNT(*) as expense_count
-            FROM personal_expenses
-            WHERE category_id = $1 AND user_id = $2
-        `;
-        const usageResult = await db.query(usageQuery, [categoryId, userId]);
-
-        if (parseInt(usageResult.rows[0].expense_count) > 0) {
-            return res.status(400).json({ 
-                error: "Cannot delete category with expenses. Delete or reassign expenses first.",
-                expense_count: parseInt(usageResult.rows[0].expense_count)
+        if (!categoryName) {
+            return res.status(400).json({
+                error: "Category name is required.",
             });
         }
 
-        const query = `
-            DELETE FROM personal_expense_categories
-            WHERE id = $1 AND user_id = $2
-            RETURNING *
-        `;
+        if (categoryName.length < 2) {
+            return res.status(400).json({
+                error: "Category name must contain at least 2 characters.",
+            });
+        }
 
-        const result = await db.query(query, [categoryId, userId]);
+        if (categoryName.length > 50) {
+            return res.status(400).json({
+                error: "Category name cannot exceed 50 characters.",
+            });
+        }
 
-        res.json({
+        // Prevent duplicate names for the same user.
+        const duplicateResult = await db.query(
+            `
+            SELECT id
+            FROM personal_expense_categories
+            WHERE user_id = $1
+              AND LOWER(TRIM(category_name)) = LOWER($2)
+            LIMIT 1
+            `,
+            [userId, categoryName]
+        );
+
+        if (duplicateResult.rows.length > 0) {
+            return res.status(409).json({
+                error: "Category already exists.",
+            });
+        }
+
+        const insertResult = await db.query(
+            `
+            INSERT INTO personal_expense_categories (
+                user_id,
+                category_name,
+                is_default
+            )
+            VALUES ($1, $2, false)
+            RETURNING
+                id,
+                category_name,
+                is_default,
+                created_at
+            `,
+            [userId, categoryName]
+        );
+
+        const category = insertResult.rows[0];
+
+        return res.status(201).json({
             success: true,
-            message: "Category deleted successfully",
-            data: result.rows[0]
+            message: "Category added successfully.",
+            data: {
+                ...category,
+                icon: "📊",
+                color: "#3B82F6",
+            },
         });
+    } catch (error) {
+        console.error("Error adding category:", error);
 
+        if (error.code === "23505") {
+            return res.status(409).json({
+                error: "Category already exists.",
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Internal server error",
+        });
+    }
+});
+
+// DELETE - Delete a user-created category.
+// A category cannot be deleted when an expense is using it.
+router.delete("/categories/:id", authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const categoryId = Number(req.params.id);
+
+        if (!Number.isInteger(categoryId) || categoryId <= 0) {
+            return res.status(400).json({
+                error: "Invalid category id.",
+            });
+        }
+
+        // Make sure the category belongs to this user.
+        const categoryResult = await db.query(
+            `
+            SELECT
+                id,
+                category_name,
+                is_default
+            FROM personal_expense_categories
+            WHERE id = $1
+              AND user_id = $2
+            LIMIT 1
+            `,
+            [categoryId, userId]
+        );
+
+        if (categoryResult.rows.length === 0) {
+            return res.status(404).json({
+                error: "Category not found.",
+            });
+        }
+
+        const category = categoryResult.rows[0];
+
+        if (category.is_default) {
+            return res.status(400).json({
+                error: "Default categories cannot be deleted.",
+            });
+        }
+
+        // Do not allow deletion while any expense references it.
+        const usageResult = await db.query(
+            `
+            SELECT COUNT(*)::INTEGER AS expense_count
+            FROM personal_expenses
+            WHERE category_id = $1
+              AND user_id = $2
+            `,
+            [categoryId, userId]
+        );
+
+        const expenseCount =
+            Number(usageResult.rows[0]?.expense_count) || 0;
+
+        if (expenseCount > 0) {
+            return res.status(409).json({
+                error:
+                    "Cannot delete category because expenses are using it. Delete or reassign those expenses first.",
+                expense_count: expenseCount,
+            });
+        }
+
+        const deleteResult = await db.query(
+            `
+            DELETE FROM personal_expense_categories
+            WHERE id = $1
+              AND user_id = $2
+            RETURNING
+                id,
+                category_name,
+                is_default
+            `,
+            [categoryId, userId]
+        );
+
+        if (deleteResult.rows.length === 0) {
+            return res.status(404).json({
+                error: "Category not found.",
+            });
+        }
+
+        return res.json({
+            success: true,
+            message: "Category deleted successfully.",
+            data: deleteResult.rows[0],
+        });
     } catch (error) {
         console.error("Error deleting category:", error);
-        res.status(500).json({ error: "Internal server error" });
+
+        // PostgreSQL FK/restrict protection.
+        if (error.code === "23503") {
+            return res.status(409).json({
+                error:
+                    "Category cannot be deleted because it is still being used.",
+            });
+        }
+
+        return res.status(500).json({
+            error: error.message || "Internal server error",
+        });
     }
 });
 
@@ -304,8 +357,6 @@ router.get("/", authenticateToken, async (req, res) => {
             SELECT 
                 c.id as category_id,
                 c.category_name,
-                c.icon,
-                c.color,
                 COUNT(e.id) as expense_count,
                 COALESCE(SUM(e.amount), 0) as total_amount
             FROM personal_expense_categories c
@@ -314,7 +365,7 @@ router.get("/", authenticateToken, async (req, res) => {
                 AND e.user_id = $1 
                 AND get_month_start(e.expense_date) = $2::DATE
             WHERE c.user_id = $1
-            GROUP BY c.id, c.category_name, c.icon, c.color
+            GROUP BY c.id, c.category_name
             ORDER BY total_amount DESC
         `;
         const categoryResult = await db.query(categoryQuery, [userId, monthStart]);
@@ -332,8 +383,6 @@ router.get("/", authenticateToken, async (req, res) => {
                 e.updated_at,
                 c.id as category_id,
                 c.category_name,
-                c.icon,
-                c.color,
                 get_expense_week(e.expense_date) as week_number
             FROM personal_expenses e
             JOIN personal_expense_categories c ON e.category_id = c.id
@@ -346,6 +395,8 @@ router.get("/", authenticateToken, async (req, res) => {
         // Format dates in response
         const expenses = expenseResult.rows.map(row => ({
             ...row,
+            icon: row.icon || "📊",
+            color: row.color || "#3B82F6",
             expense_date: formatDate(row.expense_date),
             amount: parseFloat(row.amount)
         }));
@@ -368,8 +419,8 @@ router.get("/", authenticateToken, async (req, res) => {
                     category_breakdown: categoryResult.rows.map(row => ({
                         category_id: row.category_id,
                         category_name: row.category_name,
-                        icon: row.icon,
-                        color: row.color,
+                        icon: "📊",
+                        color: "#3B82F6",
                         expense_count: parseInt(row.expense_count),
                         total_amount: parseFloat(row.total_amount)
                     }))
@@ -402,8 +453,6 @@ router.get("/:id", authenticateToken, async (req, res) => {
                 e.updated_at,
                 c.id as category_id,
                 c.category_name,
-                c.icon,
-                c.color,
                 get_expense_week(e.expense_date) as week_number
             FROM personal_expenses e
             JOIN personal_expense_categories c ON e.category_id = c.id
@@ -418,6 +467,8 @@ router.get("/:id", authenticateToken, async (req, res) => {
 
         const expense = {
             ...result.rows[0],
+            icon: result.rows[0].icon || "📊",
+            color: result.rows[0].color || "#3B82F6",
             expense_date: formatDate(result.rows[0].expense_date),
             amount: parseFloat(result.rows[0].amount)
         };
@@ -595,7 +646,6 @@ router.put("/:id", authenticateToken, async (req, res) => {
             return res.status(400).json({ error: "No fields to update" });
         }
 
-        updates.push(`updated_at = CURRENT_TIMESTAMP`);
         values.push(expenseId, userId);
 
         const query = `
